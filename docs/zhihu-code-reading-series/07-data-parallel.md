@@ -35,13 +35,15 @@ Megatron 需要与下列特性深度耦合：
 
 ---
 
+
+
 ## 梯度桶与连续 buffer
 
 核心思想：
 
-1. 把参数/梯度放入连续存储（`_ParamAndGradBuffer` 一类结构）  
-2. 按 bucket 做 all-reduce 或 reduce-scatter  
-3. 尽量与反向传播重叠，隐藏通信延迟  
+1. 把参数/梯度放入连续存储（`_ParamAndGradBuffer` 一类结构）
+2. 按 bucket 做 all-reduce 或 reduce-scatter
+3. 尽量与反向传播重叠，隐藏通信延迟
 
 阅读 `DistributedDataParallel` 时抓住：
 
@@ -53,6 +55,8 @@ Megatron 需要与下列特性深度耦合：
 
 ---
 
+
+
 ## `finalize_model_grads`：梯度世界的「收银台」
 
 文件：`finalize_model_grads.py`
@@ -63,32 +67,38 @@ Megatron 需要与下列特性深度耦合：
 - Sequence Parallel 下 LayerNorm 等梯度的处理  
 - 共享 embedding / 输出权重在 PP 首尾之间的同步  
 - MoE router 相关梯度  
-- 按 token 数缩放损失/梯度（变长、打包序列场景）  
+- 按 token 数缩放损失/梯度（变长、打包序列场景）
 
 把它当成：**所有并行模式在「optimizer.step 之前」的汇合点**。  
 
-排「数值不对但又不 crash」类 bug 时，这个文件的优先级很高。
+排「数值不对b又不 crash」类 bug 时，这个文件的优先级很高。
 
 ---
 
+
+
 ## DP 与 CP、TP 的交叉点（再强调）
 
-| 场景 | 常见通信组 |
-|------|------------|
-| 普通参数梯度同步 | `dp` 或 `dp-cp` |
-| TP 内激活相关 | TP group（更多在 mappings / layers） |
-| Expert 参数 | expert DP / EP 相关组 |
+
+| 场景        | 常见通信组                           |
+| --------- | ------------------------------- |
+| 普通参数梯度同步  | `dp` 或 `dp-cp`                  |
+| TP 内激活相关  | TP group（更多在 mappings / layers） |
+| Expert 参数 | expert DP / EP 相关组              |
+
 
 读代码时看到 `expt_dp`、`dp_cp` 不要混为一谈：MoE 下 dense 与 expert 的数据并行拓扑可以不同。
 
 ---
+
+
 
 ## FSDP 路线（知道入口即可）
 
 若启用 Megatron-FSDP 或 Torch FSDP 封装：
 
 - 参数/梯度/优化器状态更激进地分片  
-- 前向 all-gather、反向 reduce-scatter 的时序与 DDP+DistOpt 不同  
+- 前向 all-gather、反向 reduce-scatter 的时序与 DDP+DistOpt 不同
 
 文档：`docs/user-guide/features/megatron_fsdp.md`  
 代码：`distributed/fsdp/`、`torch_fully_sharded_data_parallel.py`
@@ -96,6 +106,8 @@ Megatron 需要与下列特性深度耦合：
 建议在吃透经典 DDP + DistOpt 后再进 FSDP，否则容易把两套术语揉乱。
 
 ---
+
+
 
 ## 建议阅读顺序
 
@@ -110,6 +122,8 @@ DistributedDataParallelConfig（字段）
 
 ---
 
+
+
 ## 和上一篇 PP 的衔接
 
 PP 决定「梯度在深度维何时产生」；DP 决定「副本之间何时对齐」。  
@@ -118,20 +132,24 @@ PP 决定「梯度在深度维何时产生」；DP 决定「副本之间何时�
 
 ---
 
+
+
 ## 常见坑
 
-1. **在错误的 process group 上 all-reduce** → 静默数值错误。  
-2. **忘记 embedding 跨 PP 同步** → 首尾 stage 权重漂移。  
-3. **MoE 与 dense 混用同一 DP 假设** → expert 梯度少同步/多同步。  
-4. **overlap 打开后的竞态** → 需确认 `finish_grad_sync` 栅栏位置。  
+1. **在错误的 process group 上 all-reduce** → 静默数值错误。
+2. **忘记 embedding 跨 PP 同步** → 首尾 stage 权重漂移。
+3. **MoE 与 dense 混用同一 DP 假设** → expert 梯度少同步/多同步。
+4. **overlap 打开后的竞态** → 需确认 `finish_grad_sync` 栅栏位置。
 5. **把 DistOpt 的 reduce-scatter 当成「没做 DP」** → 其实同步形态变了。
 
 ---
 
+
+
 ## 本周作业
 
-1. 在 `training.py` 的 `train_step` 中定位梯度同步与 `finalize_model_grads` 的调用顺序。  
-2. 阅读 `finalize_model_grads` 文件头/函数文档，列出不少于 4 类它处理的梯度。  
-3. 说明：当 `CP>1` 时，为什么讨论 DP 时常提到 `dp-cp`。  
+1. 在 `training.py` 的 `train_step` 中定位梯度同步与 `finalize_model_grads` 的调用顺序。
+2. 阅读 `finalize_model_grads` 文件头/函数文档，列出不少于 4 类它处理的梯度。
+3. 说明：当 `CP>1` 时，为什么讨论 DP 时常提到 `dp-cp`。
 
 下一篇转向「数据从哪来、状态往哪存」：Dataset、DistributedOptimizer、Dist Checkpoint。
