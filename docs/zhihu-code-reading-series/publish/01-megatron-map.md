@@ -277,6 +277,24 @@ print(f"[rank {dist.get_rank()}] train_step iteration={iteration}")
 
 这样运行时就能看到每张卡的执行轨迹。
 
+### 8.5 版本与 commit 固定建议
+
+Megatron-LM 的 `main` 分支更新频繁，接口可能在两次读代码之间已变更。建议：
+
+1. **记录你读代码时的 commit SHA**：`git log --oneline -1`
+2. **固定 transformer_engine 版本**：TE 的接口与 Megatron 紧密耦合。查看 `docker/.ngc_version.dev` 中的 PyTorch 镜像版本，对应的 TE 版本也记录下来。
+3. **阅读 CHANGELOG 和 release notes**：每个大版本的 `CHANGELOG.md` 会列出接口变更。
+
+```bash
+# 固定到某个稳定 commit 阅读
+git checkout <commit-sha>
+
+# 查看当前使用的 TE 要求
+grep -r "transformer_engine" requirements.txt pyproject.toml 2>/dev/null | head -5
+```
+
+**TE 依赖说明**：`megatron/core/extensions/transformer_engine.py` 通过 `try: from transformer_engine import ...` 导入 TE，并设置 `HAVE_TE = True/False`。如果没有安装 TE，代码会回退到纯 PyTorch 实现（`local` backend），功能完整但缺少 FP8 和部分 Flash Attention 加速。
+
 ---
 
 ## 9. 初学者常见陷阱（避坑指南）
@@ -338,7 +356,286 @@ VPP 要求 `num_layers / (PP × VPP)` 必须是整数。32 层 / PP=4 / VPP=2 = 
 
 ---
 
-## 11. 本文小结
+## 11. `examples/run_simple_mcore_train_loop.py` 全注解
+
+Megatron-LM 在 `examples/` 下提供了一个极简的训练示例 `run_simple_mcore_train_loop.py`，它只用 `megatron/core`，**完全绕过 `megatron/training`**。这是理解 Megatron Core 独立能力的最佳入口。
+
+### 11.1 它证明了什么
+
+这个文件证明：你**不需要**使用 `pretrain_gpt.py`、`megatron/training/arguments.py` 等庞大的驱动层，就能用 Megatron Core 组装一个可以训练的模型。换句话说：
+
+- `megatron/core` 是一个独立的、可移植的库
+- 进程组初始化 + 模型构建 + 数据加载 + 前向/反向 + 优化 = 完整训练，只需 ~280 行代码
+
+### 11.2 关键函数逐行注解
+
+```python
+# ============================================================
+# initialize_distributed()  —— 第 29-54 行
+# ============================================================
+def initialize_distributed(tensor_model_parallel_size=1,
+                            pipeline_model_parallel_size=1):
+    # 第 1 步：销毁任何已存在的模型并行状态（方便多次调用）
+    parallel_state.destroy_model_parallel()
+
+    # 从环境变量读取 rank/world_size（torchrun 注入）
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+
+    # 标准的 PyTorch NCCL 初始化
+    torch.distributed.init_process_group(
+        backend="nccl", rank=rank, world_size=world_size
+    )
+
+    # 第 2 步：Megatron Core 进程组初始化
+    # 内部会创建 TP/PP/DP/CP 等所有进程组
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size, pipeline_model_parallel_size
+    )
+```
+
+关键点：`parallel_state.initialize_model_parallel()` 是唯一需要调用的 Megatron 初始化函数，等价于 `megatron/training/initialize.py` 里 `_initialize_distributed()` 的核心逻辑。
+
+```python
+# ============================================================
+# model_provider()  —— 第 57-79 行
+# ============================================================
+def model_provider():
+    transformer_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=12,
+        num_attention_heads=4,
+        use_cpu_initialization=True,   # 在 CPU 初始化，避免 GPU OOM
+        pipeline_dtype=torch.float32,  # PP 通信时的数据类型
+    )
+    gpt_model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_local_spec(),  # local backend
+        vocab_size=100,
+        max_sequence_length=_SEQUENCE_LENGTH,
+        # pre_process=True, post_process=True 是默认值（单 PP stage）
+    )
+    return gpt_model
+```
+
+注意 `get_gpt_layer_local_spec()`：这是"local backend"，即纯 PyTorch 实现，不依赖 TE。对于读代码，local backend 远比 TE backend 更易追踪，因为没有 TE 包装层。
+
+```python
+# ============================================================
+# 主训练循环  —— 第 249-271 行
+# ============================================================
+forward_backward_func = get_forward_backward_func()
+# 根据 PP size 自动选择调度算法：
+#   PP=1 → forward_backward_no_pipelining()
+#   PP>1 → forward_backward_pipelining_with_interleaving() 或
+#           forward_backward_pipelining_without_interleaving()
+
+for iteration in range(5):
+    optim.zero_grad()
+
+    losses_reduced = forward_backward_func(
+        forward_step_func=forward_step_func,
+        data_iterator=train_iterator,
+        model=gpt_model,             # 这里传的是 DDP 包装后的 model
+        num_microbatches=1,          # 简化示例：每步只有 1 个 microbatch
+        seq_length=_SEQUENCE_LENGTH,
+        micro_batch_size=8,
+        decoder_seq_length=_SEQUENCE_LENGTH,
+        forward_only=False,          # False = 前向 + 反向
+    )
+
+    # 关键！finalize_model_grads 做两件事：
+    # 1. 非 TP 并行参数（如 LayerNorm）跨 TP rank 做 AllReduce
+    # 2. 所有参数跨 DP rank 做梯度汇总
+    finalize_model_grads([gpt_model])
+
+    optim.step()
+```
+
+`finalize_model_grads` 是这个示例最容易被忽视的调用——它等价于 `pretrain_gpt.py` 中由 `DistributedOptimizer` 内部自动完成的梯度同步。
+
+### 11.3 此示例与完整 `pretrain_gpt.py` 的差异
+
+| 特性 | `run_simple_mcore_train_loop.py` | `pretrain_gpt.py` |
+|------|---------------------------------|-------------------|
+| 优化器 | `torch.optim.Adam`（普通 Adam） | `MegatronOptimizer` / `DistributedOptimizer` |
+| 参数更新 | `optim.step()` 直接调用 | 有 gradient clipping、overflow 检测、bf16 精度转换 |
+| 梯度同步 | `finalize_model_grads` 手动调用 | 自动由 DDP/DistOpt 内部处理 |
+| 进程组 | `parallel_state` 全局 | 通过 `ProcessGroupCollection` 显式传递 |
+| 数据 | `MockGPTDataset` + 简单 DataLoader | `BlendedMegatronDataset` + 分布式 Sampler |
+| checkpoint | `dist_checkpointing.save/load` | 完整的 `save_checkpoint` / `load_checkpoint` |
+
+**结论**：如果你想做科研实验或快速迭代，从这个示例出发是最快路径。如果你需要生产级训练（FP8、梯度裁剪、分布式 ckpt），则必须使用完整的驱动层。
+
+---
+
+## 12. HuggingFace Trainer vs Megatron 心智模型对比
+
+很多读者来自 HuggingFace 生态，习惯了 `Trainer` 的使用方式。下面做一个直接对比，帮助建立"翻译"关系：
+
+| 概念 | HuggingFace Trainer | Megatron 等价物 |
+|------|---------------------|-----------------|
+| 模型 | `AutoModelForCausalLM.from_pretrained(...)` | `GPTModel(config, transformer_layer_spec, ...)` |
+| 训练配置 | `TrainingArguments` | `TransformerConfig` + `args`（命令行参数） |
+| 一步训练 | `trainer.train()` 内部的 `training_step()` | `train_step()` in `training.py` |
+| 梯度累积 | `gradient_accumulation_steps=N` | `num_microbatches = gbs / (mbs × DP)` |
+| 数据并行 | `DataParallel` / `DistributedDataParallel` | `DistributedDataParallel` in `megatron/core/distributed/` |
+| 混合精度 | `fp16=True` / `bf16=True` in TrainingArguments | `config.bf16=True` + `DistributedOptimizer` 的 fp32 master params |
+| checkpoint | `trainer.save_model()` | `save_checkpoint()` → `dist_checkpointing.save()` |
+| 评估循环 | `trainer.evaluate()` | `evaluate_and_print_results()` |
+| 分布式启动 | `accelerate launch` / `torchrun` | `torchrun` / `srun` + `pretrain_gpt.py` |
+| 张量并行 | 不支持（单卡单模型） | `ColumnParallelLinear` + `RowParallelLinear` |
+| 流水线并行 | 不支持 | `schedules.py` 的 1F1B 调度 |
+
+**最根本的差异**：HuggingFace Trainer 是"单机多卡"的抽象，梯度同步由 `torch.nn.parallel.DistributedDataParallel` 完全自动处理。Megatron 则需要**显式管理三个并行维度的进程组**——这是它强大也是它复杂的原因。
+
+**什么时候用哪个**：
+- 模型 < 7B，单机 8 卡可以放下 → HuggingFace Trainer 更简单
+- 模型 > 13B 或需要 TP/PP → Megatron 是首选
+- 需要 FP8 训练 + 自定义并行策略 → Megatron + TE
+
+---
+
+## 13. 并行组合食谱：5 种真实配置详解
+
+以下 5 种配置覆盖了从研究到生产的典型场景。每种配置给出 DP 计算和适用场景。
+
+### 配置 A：研究调试（8 卡单机，7B 模型）
+
+```
+world_size=8, TP=1, PP=1, CP=1
+DP = 8 / (1×1×1) = 8
+num_microbatches = gbs / (mbs × 8)
+```
+
+**特点**：全 DP，无模型并行。每张卡持有完整模型副本，梯度全量 AllReduce。适合 ≤7B 模型（bf16 下约 14GB）。
+**何时使用**：快速实验、消融研究、超参搜索。
+
+### 配置 B：显存紧张（8 卡单机，13B 模型）
+
+```
+world_size=8, TP=2, PP=1, CP=1
+DP = 8 / (2×1×1) = 4
+num_microbatches = gbs / (mbs × 4)
+```
+
+**特点**：TP=2 将每层切分到 2 张卡（NVLink 互连），DP=4 提供 4× 数据吞吐。13B 模型 bf16 约 26GB，单卡放不下，TP=2 后每卡约 13GB。
+**何时使用**：单机 A100/H100 8 卡，但模型刚好超过单卡显存。
+
+### 配置 C：中等规模（64 卡，30B 模型）
+
+```
+world_size=64, TP=4, PP=2, CP=1
+DP = 64 / (4×2×1) = 8
+num_microbatches = gbs / (mbs × 8)
+```
+
+**特点**：TP=4 在单机内（4 卡 NVLink），PP=2 跨两台机器，DP=8 提供数据并行。30B 模型 bf16 约 60GB，TP=4 后每卡约 15GB。PP=2 的 bubble 开销约 `(2-1)/num_microbatches`。
+**何时使用**：8×8 卡集群，30-40B 量级模型。
+
+### 配置 D：大规模生产（256 卡，70B 模型）
+
+```
+world_size=256, TP=8, PP=4, CP=1
+DP = 256 / (8×4×1) = 8
+num_microbatches = gbs / (mbs × 8)
+```
+
+**特点**：TP=8 充分利用单机 8 卡 NVLink，PP=4 跨 4 台机器，DP=8 提供适度的数据并行。70B bf16 约 140GB，TP=8 后每卡约 17.5GB。bubble 约 `(4-1)/num_microbatches`，需要 num_microbatches≥12 才能将 bubble 控制在 25% 以内。
+**何时使用**：NVIDIA DGX H100 集群，Llama-70B 规模训练。
+
+### 配置 E：超长序列（512 卡，70B 模型，128K 上下文）
+
+```
+world_size=512, TP=8, PP=4, CP=2
+DP = 512 / (8×4×2) = 8
+num_microbatches = gbs / (mbs × 8)
+```
+
+**特点**：在配置 D 的基础上，CP=2 将 128K 的序列切成两段，每段 64K，分布在 2 张卡上。这使得注意力矩阵的内存开销也减半。CP 使用 Ring AllReduce 通信注意力 KV，通信量随 CP 增大而增大。
+**何时使用**：序列长度 > 32K 的训练，如长文档、代码库上下文。
+
+### 一句话规律
+
+```
+TP ≤ 单机 GPU 数（NVLink 域内）
+PP = 机器数的因数（跨机器通信可接受）
+CP > 1 仅在序列长度 > 32K 时考虑
+DP = 剩余卡数（越大越好，但受 gbs/mbs 整除性限制）
+```
+
+---
+
+## 14. "如何阅读 2000 行文件"——以 schedules.py 为例
+
+`megatron/core/pipeline_parallel/schedules.py` 是 Megatron 中最复杂的单个文件之一，约 2000 行，包含多种流水线调度算法。对于初学者，直接从头读是灾难——正确的方法是**分层剥洋葱**。
+
+### 第 1 层：先读顶层函数签名
+
+```bash
+# 用 grep 找出所有 def 函数
+grep "^def " megatron/core/pipeline_parallel/schedules.py
+```
+
+输出类似：
+```
+def get_forward_backward_func()
+def forward_backward_no_pipelining(...)
+def forward_backward_pipelining_without_interleaving(...)
+def forward_backward_pipelining_with_interleaving(...)
+```
+
+这 4 个函数就是文件的全部公开 API。其中 `get_forward_backward_func()` 是入口，它根据 PP size 返回合适的调度函数。
+
+### 第 2 层：从最简单的路径开始
+
+`forward_backward_no_pipelining`（PP=1 时使用）是最简单的，只有约 50 行。先把它读透：它做什么？在什么条件下被选中？返回什么？
+
+### 第 3 层：对比阅读
+
+读完 `no_pipelining` 后，再读 `without_interleaving`（1F1B，无 VPP）。重点找"这两个函数有什么不同"：
+- `without_interleaving` 多了什么循环？
+- P2P 通信在哪里发生？
+- microbatch 的顺序是怎样的？
+
+### 第 4 层：最后读 `with_interleaving`（1F1B + VPP）
+
+这是最复杂的路径，但有了前面的对比基础，你能识别"哪些是新增的 VPP 特有逻辑"。
+
+### 关键洞察：调度文件的状态机模式
+
+所有调度函数都遵循同一个模式：
+
+```python
+# 伪代码展示调度函数的骨架
+def forward_backward_pipelining_without_interleaving(...):
+    # 阶段 1：warm-up（流水线填满）
+    for step in range(warmup_steps):
+        run_forward()     # 前向 microbatch
+        send_forward()    # P2P 发送激活给下一 stage
+
+    # 阶段 2：稳态 1F1B（每步一进一出）
+    for step in range(steady_state_steps):
+        run_forward()
+        send_forward()
+        receive_backward()
+        run_backward()
+        send_backward()
+
+    # 阶段 3：cooldown（流水线排空）
+    for step in range(cooldown_steps):
+        receive_backward()
+        run_backward()
+        send_backward()
+```
+
+一旦你认出这个骨架，文件中 90% 的代码都是在处理细节（VPP、CP、错误处理、性能 profiling）。
+
+---
+
+## 15. 本文小结
 
 现在你手里有了：
 
@@ -346,8 +643,12 @@ VPP 要求 `num_layers / (PP × VPP)` 必须是整数。32 层 / PP=4 / VPP=2 = 
 2. **完整术语表**：再也不会被 TP/PP/DP/CP/EP/SP/VPP/DistOpt/MFU 搞混
 3. **一句话故事**：能向别人解释"Megatron 一步训练发生了什么"
 4. **推荐阅读路线**：Phase 1 → 2 → 3，有先后依赖
-5. **环境搭建方法**：能运行最小示例
+5. **环境搭建方法**：能运行最小示例；版本固定建议
 6. **避坑清单**：7 个常见错误，提前规避
+7. **`run_simple_mcore_train_loop.py` 注解**：理解 Megatron Core 最小用法
+8. **HuggingFace vs Megatron**：翻译关系，帮助已有 HF 经验的读者快速上手
+9. **5 种并行配置食谱**：覆盖 7B-180B 规模的典型场景
+10. **阅读 2000 行文件的方法论**：以 schedules.py 为例
 
 下一篇，我们将用"探针法"从 `pretrain_gpt.py` 的第一行开始，逐行追踪到 `optimizer.step`，让整个训练循环在脑子里留下清晰的印记。
 
@@ -355,7 +656,7 @@ VPP 要求 `num_layers / (PP × VPP)` 必须是整数。32 层 / PP=4 / VPP=2 = 
 
 ## 课后练习
 
-**练习 1**：打开 `/workspace/pretrain_gpt.py`，找到 `BATCH_KEYS` 列表（第 83-94 行），回答：这个列表的顺序有什么特殊之处？（提示：看注释）
+**练习 1**：打开 `/workspace/pretrain_gpt.py`，找到 `BATCH_KEYS` 列表，回答：这个列表的顺序有什么特殊之处？（提示：看注释）
 
 **练习 2**：运行以下命令，观察输出中 `DP` 是多少：
 
@@ -373,8 +674,6 @@ torchrun --nproc_per_node=2 pretrain_gpt.py \
 **练习 3**：在 `megatron/core/` 目录下，找一个同时被 `megatron/training/` 和 `megatron/core/models/` 导入的文件，说明它属于哪个"层"。
 
 **练习 4（思考题）**：假设你有 16 张 A100，想训练一个 13B 参数的模型，你会如何设置 TP/PP/DP？请写出你的理由（没有唯一正确答案）。
-
----
 
 ---
 
@@ -494,5 +793,171 @@ dp_group = mpu.get_data_parallel_group()
 在 `megatron/core` 内部的新代码中，应避免直接调用 `mpu.get_*_group()`，而应通过 `ProcessGroupCollection` 传递（见 `CLAUDE.md`）。但在 `megatron/training` 和阅读时，`mpu` 是理解代码的关键入口。
 
 ---
+
+## 附录 E：扩展 FAQ（10 个初学者高频问题）
+
+**Q1：为什么 Megatron 使用 `[S, B, H]`（Sequence-first）而不是 PyTorch 惯用的 `[B, S, H]`（Batch-first）？**
+
+A：历史原因。Sequence-first 格式在张量并行下对内存访问更友好——矩阵乘法时，序列维度是"外层循环"，batch 内部的并行计算可以更好地利用 CUDA 的 warp 布局。现代版本已开始支持 `[B, S, H]`（`qkv_format` 参数），但默认仍是 `[S, B, H]`。
+
+**Q2：`--no-pipeline-model-parallel` 这个参数存在吗？**
+
+A：不存在这个参数名。设置 `--pipeline-model-parallel-size 1`（默认值）即相当于不使用流水线并行。`get_forward_backward_func()` 会自动选择 `forward_backward_no_pipelining`。
+
+**Q3：Megatron 的 `DistributedDataParallel` 和 PyTorch 的 `torch.nn.parallel.DistributedDataParallel` 有什么区别？**
+
+A：Megatron 的 DDP（`megatron/core/distributed/`）做了以下定制：
+- 将所有参数的梯度聚合到一个**连续内存 buffer**，便于一次性 AllReduce/ReduceScatter
+- 支持梯度桶（bucket）的重叠通信（`overlap_grad_reduce=True`）
+- 与 `DistributedOptimizer` 深度集成，支持 ZeRO-style 的 optimizer state sharding
+
+**Q4：`--sequence-parallel` 到底省了多少显存？**
+
+A：理论上，LayerNorm 和 Dropout 的激活值按 TP 切分，省了 `(1 - 1/TP)` 的比例。对于 TP=8，这意味着这部分激活省了 87.5%。在 70B 模型的完整 activation recompute 场景下，SP 带来的显存节省相对有限；但在不启用 recompute 时，它是显存优化的重要手段。
+
+**Q5：可以在 CPU 上运行 Megatron 做单元测试吗？**
+
+A：可以，通过 `use_cpu_initialization=True` 在 CPU 上初始化模型，并使用 `gloo` backend 代替 `nccl`：
+```python
+torch.distributed.init_process_group(backend="gloo", ...)
+TransformerConfig(use_cpu_initialization=True, ...)
+```
+大量 `tests/unit_tests/` 下的测试就是这样运行的。
+
+**Q6：`context_parallel_size > 1` 时，注意力怎么计算？KV 不是在不同卡上吗？**
+
+A：CP 使用 Ring Attention：每张卡持有完整的 Q 的一个切片，但 K/V 会通过 Ring AllGather 在 CP 组内循环传递。每张卡依次与所有其他卡的 K/V 做注意力计算，最终每张卡得到对应序列切片的注意力输出。这比朴素 AllGather 全量 KV 更节省内存。
+
+**Q7：`--recompute-granularity selective` 和 `full` 分别在什么场景下用？**
+
+A：`selective`（默认重计算 `core_attn`）：只重计算注意力的核心计算（QK^T → softmax → V），这部分内存占用大但计算相对便宜，是显存/速度 tradeoff 最优的选项，推荐大多数场景。`full`：重计算整个 Transformer 层，显存节省最大（约 60-80%），但训练时间增加约 30-40%，适合显存极度紧张的场景。
+
+**Q8：`TransformerConfig` 里的 `ffn_hidden_size` 设置为多少合适？**
+
+A：传统 GPT（ReLU FFN）：`4 × hidden_size`。使用 SwiGLU（`gated_linear_unit=True`）时：通常是 `8/3 × hidden_size` 向上取整到 64 的倍数，例如 Llama-7B 的 `hidden_size=4096`，`ffn_hidden_size=11008`（约 `8/3 × 4096 ≈ 10922`，取最近的 64 倍数）。
+
+**Q9：Megatron 的 `--transformer-impl` 参数有哪些选项，默认是哪个？**
+
+A：常见选项：
+- `local`：纯 PyTorch 实现，不依赖 TE，适合调试
+- `transformer_engine`（默认，如果有 TE）：使用 NVIDIA Transformer Engine，支持 FP8、Flash Attention、融合 LayerNorm+Linear
+- `inference_optimized`：推理优化的实现，需要 TE
+
+如果环境没有安装 TE，即使指定 `transformer_engine` 也会回退到 `local`（并打印警告）。
+
+**Q10：Megatron 的 checkpoint 是什么格式？可以直接加载到 HuggingFace 吗？**
+
+A：Megatron 使用 `dist_checkpointing`（ShardedTensor 格式），每个 PP/TP rank 保存自己的分片。不能直接加载到 HuggingFace——需要先用 `tools/checkpoint/` 下的转换脚本（如 `convert_checkpoint_from_megatron_to_transformers.py`）将 Megatron checkpoint 合并并转换为 HuggingFace 格式。反方向同理。
+
+---
+
+## 附录 F：术语速记小测验（带答案）
+
+以下 5 题用于检验你对核心概念的掌握。
+
+**题 1**：`world_size=32`, `TP=4`, `PP=2`, `CP=1`，问 `DP=?`
+
+> **答**：`DP = 32 / (4×2×1) = 4`
+
+**题 2**：`global_batch_size=256`, `micro_batch_size=4`, `DP=4`，问 `num_microbatches=?`
+
+> **答**：`num_microbatches = 256 / (4×4) = 16`
+
+**题 3**：PP=4, VPP=2，32 层模型，PP rank=3, vp_stage=1 持有哪些全局层？
+
+> **答**：每个 chunk = 32/(4×2) = 4 层。全局偏移 = vp_stage × PP + pp_rank = 1×4 + 3 = 7，即第 7 个 chunk → 全局层 28-31。
+
+**题 4**：`recompute_granularity='selective'` 默认重计算哪个子模块？
+
+> **答**：`core_attn`（核心注意力计算：QK^T → softmax → V），由 `TransformerConfig.__post_init__` 中 `if self.recompute_modules is None: self.recompute_modules = ["core_attn"]` 设置。
+
+**题 5**：使用 `DistributedOptimizer` 时，为什么 `train_step` 需要同时调用 `zero_grad_buffer()` 和 `optimizer.zero_grad()`？
+
+> **答**：`zero_grad_buffer()` 清零 `param.main_grad`（连续内存 buffer，用于 ReduceScatter 通信）；`optimizer.zero_grad()` 清零 `param.grad`（PyTorch 标准梯度）。两者可能指向不同内存区域，都不清零会导致梯度跨步累积。
+
+---
+
+---
+
+## 附录 G：num_microbatches_calculator —— 动态 batch size 调度
+
+`megatron/core/num_microbatches_calculator.py` 是一个常被忽略但非常重要的文件。它实现了两种 batch size 策略：
+
+### G.1 恒定 batch size（`ConstantNumMicroBatchesCalculator`）
+
+默认模式。计算公式如前所述：
+
+```python
+num_microbatches = global_batch_size // (micro_batch_size * data_parallel_size)
+```
+
+初始化时一次性确定，之后调用 `get_num_microbatches()` 始终返回同一个数。
+
+### G.2 阶梯式 batch size 调度（`StepBatchsizeNumMicroBatchesCalculator`）
+
+由 `--step-batch-size-schedule` 参数触发。格式为 `"阈值1:bs1 阈值2:bs2 ..."`，阈值支持 K/M/B/T 后缀：
+
+```bash
+# 示例：训练过程中逐步增大 batch size
+# 前 250B tokens 用 bs=768，之后用 1536，再之后用 3072
+--step-batch-size-schedule "0:768 250B:1536 500B:3072 750B:6144"
+--seq-length 4096
+```
+
+**为什么要动态增大 batch size？**
+
+训练初期，小 batch size 有更强的梯度噪声，帮助逃离局部极小值；训练后期，大 batch size 提高硬件利用率（更高的 MFU）。这是 GPT-3 论文和后续工作验证的有效策略。
+
+每步调用 `update_num_microbatches(consumed_samples)` 时，计算器会检查当前 consumed_samples 是否达到下一个阈值，如果是，则切换到更大的 `global_batch_size`，`num_microbatches` 随之增加。
+
+```python
+# 伪代码展示阶梯调度逻辑
+def update(self, consumed_samples, consistency_check, verbose=False):
+    self.current_global_batch_size = self._get_batch_size_for_samples(consumed_samples)
+    self.num_micro_batches = (
+        self.current_global_batch_size // self.micro_batch_times_data_parallel_size
+    )
+```
+
+**注意**：切换阈值时，`current_global_batch_size` 必须能被 `micro_batch_size × DP` 整除，否则 `consistency_check=True` 时会报错。这是生产使用时需要仔细规划各阶段 batch size 的原因。
+
+---
+
+## 附录 H：`megatron/core` 代码风格约定速查
+
+阅读 Megatron Core 代码时，了解以下约定可以减少困惑：
+
+| 约定 | 说明 |
+|------|------|
+| `pg_collection` 参数 | 新代码通过 `ProcessGroupCollection` 显式传递进程组，而不是从 `parallel_state` 读取全局变量 |
+| `tp_group` 参数 | 某些旧接口仍接受 `tp_group: ProcessGroup` 而非 `pg_collection`，两种风格并存 |
+| `pre_process` / `post_process` | 控制 PP stage 是否持有 embedding / output_layer，始终显式传递 |
+| `vp_stage` 参数 | VPP 场景下标识当前是第几个虚拟 stage（0-indexed） |
+| `@dataclass` 配置类 | `TransformerConfig`、`DistributedDataParallelConfig` 等都是 frozen dataclass，创建后不可修改 |
+| `build_module(spec, ...)` | 统一的模块装配接口，避免在代码中直接写 `if use_te: ... else: ...` |
+| `ShardedTensor` | checkpoint 中每个参数的分布式存储描述符，包含 global_shape / local_shape / global_offset |
+
+---
+
+## 附录 I：阅读清单速查卡
+
+把这张卡打印出来，阅读时随时参考：
+
+```
+初次阅读顺序（推荐）:
+1. pretrain_gpt.py           → 入口，掌握 __main__ 结构
+2. megatron/training/training.py  pretrain()  → 训练总指挥
+3. megatron/training/arguments.py validate_args()  → 参数验证，理解所有约束
+4. megatron/core/models/gpt/gpt_model.py  → GPTModel 结构
+5. megatron/core/transformer/transformer_layer.py  → 单层计算
+6. megatron/core/parallel_state.py  initialize_model_parallel()  → 进程组
+7. megatron/core/pipeline_parallel/schedules.py  → 调度算法（最后读）
+
+遇到问题时查阅:
+- batch size / DP 不整除 → arguments.py validate_args
+- 形状报错 → transformer_layer.py + attention.py
+- 梯度同步 → megatron/core/distributed/
+- checkpoint 格式 → megatron/core/dist_checkpointing/
+```
 
 *下一篇：[精读 Megatron 源码（2）：完整拆解一次训练——从 `__main__` 到 `optimizer.step`](./02-pretrain-loop.md)*
