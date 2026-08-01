@@ -475,28 +475,44 @@ activation_size ≈ 1 × 2048 × 4096 × 2 = 16 MB
 
 ```
 阶段设置：
-  PP = 2, m = 4（4 个 microbatch）
+  PP = 2, m = 4
   stage 0 warmup = min(4, 2-0-1) = 1
   stage 1 warmup = min(4, 2-1-1) = 0
+```
 
-# 按时间列对齐（Fi/Bi = microbatch i 的前向/反向；编号从 1 起）
-时间 →     1    2    3    4    5    6    7    8
-stage 0   F1   F2   B1   F3   B2   F4   B3   B4
+**依赖铁律**：stage1 的 `Bk` 必须先完成并把梯度 P2P 回 stage0，stage0 才能 `Bk`。  
+因此 **禁止** 把两边的 `B1`（或任意同一 `Bk`）画在同一时间列——那是错的。
+
+稳态本地顺序（`schedules.py`）：
+
+```text
+forward → send_forward_recv_backward → backward → send_backward_recv_forward
+```
+
+按「一步 = 一次 F 或一次 B；`·` = 等 P2P」对齐：
+
+```text
+时间 →     1    2    3    4    5    6    7    8    9   10
+stage 0   F1   F2   ·    B1   F3   B2   F4   B3   ·    B4
 stage 1        F1   B1   F2   B2   F3   B3   F4   B4
 ```
 
-关键依赖：stage1 上某个 `Fk` 做完后，同一拍或紧接着做 `Bk`，再把梯度发回 stage0；  
-**stage0 的 `Bk` 不能与 stage1 的 `Fk` 画在同一列**（否则违反激活/梯度依赖）。
+| 时间 | stage0 | stage1 | 要点 |
+|------|--------|--------|------|
+| 1 | F1 | · | warmup |
+| 2 | F2 | F1 | stage0 先算下一拍 Forward |
+| 3 | ·（`send_F2_recv_B1`） | B1 | **仅 stage1 做 B1** |
+| 4 | B1 | F2 | stage0 的 B1 晚一拍 |
+| 5–8 | F3/B2/F4/B3 | B2/F3/B3/F4 | 稳态交错 |
+| 9–10 | · 然后 B4 | B4 然后结束 | cooldown 同样先 stage1 再 stage0 |
 
-带通信注解的同一调度：
-
+```text
+# 错画（同一列两个 B1）——不合理
+stage 0: F1  F2  B1 ...
+stage 1:     F1  B1 ...
 ```
-stage 0: F1 →send→ F2 ←recv B1→ F3 ←recv B2→ F4 ←recv B3→ B4
-stage 1:      ←recv F1→ B1→send→ F2 ... F3 ... F4 → B4→send→
-```
 
-气泡主要出现在 stage0 开头（warmup 空等 stage1）与末尾 cooldown；  
-近似气泡率 `(PP-1)/m = 1/4 = 25%`。m 越大，该比例越低。
+近似气泡率常写 `(PP-1)/m = 25%`；细算应计入表中的 `·`。
 
 ---
 
