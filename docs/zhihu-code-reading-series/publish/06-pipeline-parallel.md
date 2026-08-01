@@ -471,7 +471,7 @@ activation_size ≈ 1 × 2048 × 4096 × 2 = 16 MB
 
 ---
 
-## 11. 完整示例：PP=2，m=4 的时间线
+## 11. 完整示例：PP=2，m=4 的时间线（1F1B）
 
 ```
 阶段设置：
@@ -479,17 +479,24 @@ activation_size ≈ 1 × 2048 × 4096 × 2 = 16 MB
   stage 0 warmup = min(4, 2-0-1) = 1
   stage 1 warmup = min(4, 2-1-1) = 0
 
-时间步：  t1   t2   t3   t4   t5   t6
-stage 0:  F0  [F1B0  F2B1  F3B2]  B3
-stage 1:  F0   F1   F2   F3   B3   B2   B1   B0
-
-更准确的格式（考虑通信延迟）：
-
-stage 0: F0 →send→ F1 ←recv B0→ F2 ←recv B1→ F3 ←recv B2→ B3
-stage 1:      ←recv F0→ ←recv F1→ F2 ←recv F3→  B3→send→  B2→send→  B1→send→  B0→send
+# 按时间列对齐（Fi/Bi = microbatch i 的前向/反向；编号从 1 起）
+时间 →     1    2    3    4    5    6    7    8
+stage 0   F1   F2   B1   F3   B2   F4   B3   B4
+stage 1        F1   B1   F2   B2   F3   B3   F4   B4
 ```
 
-气泡仅出现在 stage 0 的开头（1 步 warmup）和末尾（1 步 cooldown），共 2 步，总时间 10 步，气泡率 = 2/10 = 20%。当 m=8 时，气泡率降到 2/14 ≈ 14%。
+关键依赖：stage1 上某个 `Fk` 做完后，同一拍或紧接着做 `Bk`，再把梯度发回 stage0；  
+**stage0 的 `Bk` 不能与 stage1 的 `Fk` 画在同一列**（否则违反激活/梯度依赖）。
+
+带通信注解的同一调度：
+
+```
+stage 0: F1 →send→ F2 ←recv B1→ F3 ←recv B2→ F4 ←recv B3→ B4
+stage 1:      ←recv F1→ B1→send→ F2 ... F3 ... F4 → B4→send→
+```
+
+气泡主要出现在 stage0 开头（warmup 空等 stage1）与末尾 cooldown；  
+近似气泡率 `(PP-1)/m = 1/4 = 25%`。m 越大，该比例越低。
 
 ---
 
