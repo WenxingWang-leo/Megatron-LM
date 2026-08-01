@@ -783,9 +783,9 @@ rank 4,5       F1   B1   F2   B2   F3   B3   F4   B4
 |------|-------------------|-------------------|------|
 | 1 | F1，send 激活 | （等） | warmup |
 | 2 | F2（稳态第一个 F） | F1 | F2 与 F1 无直接冲突 |
-| 3 | `·` 在 `send_F2_recv_B1` 等待 | B1，send 梯度 | **只有 stage1 在做 B1** |
+| 3 | `·` 在 `send_F2_recv_B1` 等待 | B1，send 梯度 | **只有 stage1 在做 B1**；stage0 **不是 F3**（见下） |
 | 4 | 收到梯度后 B1 | F2 | stage0 的 B1 比 stage1 晚一拍 |
-| 5 | F3 | B2 | 稳态交错 |
+| 5 | F3 | B2 | 稳态交错：先 B1 再 F3 |
 | 6 | B2 | F3 | |
 | 7 | F4 | B3 | |
 | 8 | B3 | F4 | |
@@ -793,6 +793,38 @@ rank 4,5       F1   B1   F2   B2   F3   B3   F4   B4
 | 10 | B4 | （结束） | warmup 对应的那次 cooldown B |
 
 `·` = 计算气泡 / 卡在 P2P 上等待对端。
+
+#### 为什么 t=3 时 stage0 不是 F3？（高频疑问）
+
+你的直觉来自**数据依赖**：`F3` 并不需要 `B1` 的结果，理论上 stage1 做 `B1` 时，stage0 完全可以去算 `F3`。
+
+但 Megatron 的 **non-interleaved 1F1B 调度顺序不允许这样做**。稳态循环在源码里是写死的：
+
+```python
+# schedules.py 稳态 1F1B（每个 remaining microbatch 一轮）
+output_tensor = forward_step(...)                      # 本轮 Forward（如 F2）
+grad = send_forward_recv_backward(output_tensor, ...)  # 发出本轮激活，并阻塞等待更早 microbatch 的梯度（如 B1）
+backward_func(..., grad)                               # 本轮才做对应的 Backward（如 B1）
+send_backward_recv_forward(...)                        # 再进入下一轮 → 下一轮才是 F3
+```
+
+所以 stage0 本地顺序是：
+
+```text
+F1 → F2 → (卡住等 B1 梯度) → B1 → F3 → B2 → F4 → B3 → B4
+         ↑
+         t=3 时卡在这里，还没轮到 F3
+```
+
+**为什么要故意卡住、不去抢 F3？** —— 这是 1F1B 控制激活显存的核心：
+
+| 若 t=3 时 stage0 做… | 尚未反传释放的 microbatch | 在途激活大约 |
+|----------------------|---------------------------|--------------|
+| `·` 等待（真实 1F1B） | F1、F2 | ≤ PP(=2) 量级 |
+| `F3`（你问的替代） | F1、F2、F3 | 变成 3，更像加深 warmup / 靠近 GPipe |
+
+1F1B 的定义就是：warmup 只预先灌 `PP-1` 个 Forward，之后严格 **1 个 Forward + 1 个 Backward** 交替，避免在途 microbatch 无限变多。  
+因此：**不是「依赖上不能 F3」，而是「调度上选择不做 F3」**。
 
 **两种常见错画**：
 

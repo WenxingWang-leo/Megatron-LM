@@ -501,10 +501,14 @@ stage 1        F1   B1   F2   B2   F3   B3   F4   B4
 |------|--------|--------|------|
 | 1 | F1 | · | warmup |
 | 2 | F2 | F1 | stage0 先算下一拍 Forward |
-| 3 | ·（`send_F2_recv_B1`） | B1 | **仅 stage1 做 B1** |
+| 3 | ·（`send_F2_recv_B1`） | B1 | **仅 stage1 做 B1**；stage0 不是 F3 |
 | 4 | B1 | F2 | stage0 的 B1 晚一拍 |
-| 5–8 | F3/B2/F4/B3 | B2/F3/B3/F4 | 稳态交错 |
+| 5–8 | F3/B2/F4/B3 | B2/F3/B3/F4 | 先 B1 后才进入 F3 |
 | 9–10 | · 然后 B4 | B4 然后结束 | cooldown 同样先 stage1 再 stage0 |
+
+**为什么 t=3 stage0 不是 F3？**  
+数据依赖上 `F3` 不需要 `B1`；但源码稳态循环是 `F → send_forward_recv_backward(阻塞等梯度) → B → …`，下一轮才到 `F3`。  
+1F1B 用这个顺序把在途 microbatch 压在约 `PP` 个，避免 t=3 再灌 `F3` 把激活显存做成「更深的 warmup」。
 
 ```text
 # 错画（同一列两个 B1）——不合理
