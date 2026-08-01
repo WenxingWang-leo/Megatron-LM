@@ -752,49 +752,63 @@ DP group:
   DP pair 2: PP group 0 的 rank 4,5 与 PP group 1 的 rank 6,7 → DP group [4,6] 和 [5,7]
 ```
 
-**4 个 microbatch 的流水线时序（PP=2，真正的 1F1B）**：
+**4 个 microbatch 的流水线时序（PP=2，1F1B，按依赖对齐）**：
 
-> 注意：下面这张才是 Megatron `without_interleaving` 的 1F1B。  
-> **错误画法**（曾误写成「全前向再全反向」，且 stage0 在 stage1 还在做 `F4` 时就开始 `B4`）是不合法的：  
-> stage1 必须先完成某个 microbatch 的 Forward，再做该 microbatch 的 Backward，并把梯度 P2P 回 stage0，stage0 才能开始对应的 Backward。
+源码：`forward_backward_pipelining_without_interleaving`  
+`warmup = total_stages - current_stage - 1` → stage0 warmup=1，stage1 warmup=0。
 
+**硬依赖（画图时绝不能违反）**：
+
+1. stage0 的 `Fk` 完成后，激活 P2P 到 stage1，stage1 才能 `Fk`  
+2. stage1 的 `Bk` 完成后，梯度 P2P 回 stage0，stage0 才能 `Bk`  
+3. 因此 **同一时刻两边都写 `B1` 不合理**——stage0 的 `B1` 必须严格晚于 stage1 的 `B1`
+
+对照源码稳态循环顺序（每个 stage 本地）：
+
+```text
+forward → send_forward_recv_backward → backward → send_backward_recv_forward
 ```
-warmup(r) = min(m, PP - r - 1)
-  → stage0 (ranks 0,1): warmup=1
-  → stage1 (ranks 4,5): warmup=0
 
-时间 →     1    2    3    4    5    6    7    8
-rank 0,1  F1   F2   B1   F3   B2   F4   B3   B4
+stage0 会先做下一个 microbatch 的 Forward，再在 `send_forward_recv_backward` 里**等待**上一个 microbatch 的梯度，然后才 Backward。
+
+```text
+时间 →     1    2    3    4    5    6    7    8    9   10
+rank 0,1  F1   F2   ·    B1   F3   B2   F4   B3   ·    B4
 rank 4,5       F1   B1   F2   B2   F3   B3   F4   B4
 ```
 
-依赖读法（以 microbatch 4 为例）：
+读法：
 
-1. t=6：stage0 做完 `F4`，把激活 P2P 发给 stage1  
-2. t=7：stage1 做 `F4`，立刻做 `B4`，把梯度 P2P 回 stage0  
-3. t=8：stage0 收到梯度后做 `B4`
+| 时间 | rank 0,1 (stage0) | rank 4,5 (stage1) | 说明 |
+|------|-------------------|-------------------|------|
+| 1 | F1，send 激活 | （等） | warmup |
+| 2 | F2（稳态第一个 F） | F1 | F2 与 F1 无直接冲突 |
+| 3 | `·` 在 `send_F2_recv_B1` 等待 | B1，send 梯度 | **只有 stage1 在做 B1** |
+| 4 | 收到梯度后 B1 | F2 | stage0 的 B1 比 stage1 晚一拍 |
+| 5 | F3 | B2 | 稳态交错 |
+| 6 | B2 | F3 | |
+| 7 | F4 | B3 | |
+| 8 | B3 | F4 | |
+| 9 | `·` 等 B4 梯度 | B4，send 梯度 | cooldown 前的等待 |
+| 10 | B4 | （结束） | warmup 对应的那次 cooldown B |
 
-因此 **stage1 上「`F4` 之后紧接着 `B4`」**；**stage0 的 `B4` 必须更晚一拍**，绝不能和 stage1 的 `F4` 画在同一列。
+`·` = 计算气泡 / 卡在 P2P 上等待对端。
 
-若画成 GPipe（先灌满全部 Forward，再统一 Backward），正确依赖应是：
+**两种常见错画**：
 
+```text
+# 错 1：同一列两边都是 B1（违反梯度依赖）
+rank 0,1  F1  F2  B1  ...
+rank 4,5      F1  B1  ...
+
+# 错 2：GPipe 式「先全部 F 再全部 B」，还让 stage0 过早 B4
+rank 0,1  F1 F2 F3 F4 B4 ...
+rank 4,5     F1 F2 F3 F4 B4 ...
 ```
-时间 →     1    2    3    4    5    6    7    8    9
-rank 0,1  F1   F2   F3   F4   ·    B4   B3   B2   B1
-rank 4,5       F1   F2   F3   F4   B4   B3   B2   B1
-```
 
-这里 stage1 在 t=5 做 `F4`、t=6 做 `B4`；stage0 在 t=5 空等（`·`），t=7 才做 `B4`。  
-Megatron 默认训练路径用的是上面的 **1F1B**，不是 GPipe。
+GPipe 若要画对，stage1 在 `F4` 后于下一拍做 `B4`，stage0 再晚一拍才 `B4`，且中间往往有空等。Megatron 默认训练用的是上面的 **1F1B**，不是 GPipe。
 
-阶段划分（1F1B）：
-
-- `F1` = microbatch 1 的前向；`B1` = microbatch 1 的反向  
-- **warm-up**：stage0 先推 `F1`（t=1）；stage1 warmup=0  
-- **稳态 1F1B**：交替 Forward/Backward（stage0：`F2 B1 F3 B2 F4 B3`；stage1：`F1 B1 ... F3 B3`）  
-- **cooldown**：收尾 Backward（stage0 的 `B4`；stage1 的 `F4 B4` 落在末尾两拍）
-
-流水线 bubble 比例（近似）≈ `(PP-1) / num_microbatches = (2-1)/4 = 25%`
+气泡直觉：stage0 在 t=3、t=9 等梯度；近似比例仍常写成 `(PP-1)/m = 1/4`，细算要把这些 `·` 算进总时间步。
 
 **每个 rank 在 `get_batch` 中的行为**：
 
