@@ -752,20 +752,49 @@ DP group:
   DP pair 2: PP group 0 的 rank 4,5 与 PP group 1 的 rank 6,7 → DP group [4,6] 和 [5,7]
 ```
 
-**4 个 microbatch 的流水线时序（PP=2，1F1B）**：
+**4 个 microbatch 的流水线时序（PP=2，真正的 1F1B）**：
+
+> 注意：下面这张才是 Megatron `without_interleaving` 的 1F1B。  
+> **错误画法**（曾误写成「全前向再全反向」，且 stage0 在 stage1 还在做 `F4` 时就开始 `B4`）是不合法的：  
+> stage1 必须先完成某个 microbatch 的 Forward，再做该 microbatch 的 Backward，并把梯度 P2P 回 stage0，stage0 才能开始对应的 Backward。
 
 ```
+warmup(r) = min(m, PP - r - 1)
+  → stage0 (ranks 0,1): warmup=1
+  → stage1 (ranks 4,5): warmup=0
+
 时间 →     1    2    3    4    5    6    7    8
-rank 0,1  F1   F2   F3   F4   B4   B3   B2   B1
+rank 0,1  F1   F2   B1   F3   B2   F4   B3   B4
+rank 4,5       F1   B1   F2   B2   F3   B3   F4   B4
+```
+
+依赖读法（以 microbatch 4 为例）：
+
+1. t=6：stage0 做完 `F4`，把激活 P2P 发给 stage1  
+2. t=7：stage1 做 `F4`，立刻做 `B4`，把梯度 P2P 回 stage0  
+3. t=8：stage0 收到梯度后做 `B4`
+
+因此 **stage1 上「`F4` 之后紧接着 `B4`」**；**stage0 的 `B4` 必须更晚一拍**，绝不能和 stage1 的 `F4` 画在同一列。
+
+若画成 GPipe（先灌满全部 Forward，再统一 Backward），正确依赖应是：
+
+```
+时间 →     1    2    3    4    5    6    7    8    9
+rank 0,1  F1   F2   F3   F4   ·    B4   B3   B2   B1
 rank 4,5       F1   F2   F3   F4   B4   B3   B2   B1
 ```
 
-- `F1` = microbatch 1 的前向；`B1` = microbatch 1 的反向
-- warm-up（填充）：rank 0,1 的 F1；时间 1
-- 稳态 1F1B：时间 2-7
-- cooldown（排空）：rank 4,5 的 B1；时间 8
+这里 stage1 在 t=5 做 `F4`、t=6 做 `B4`；stage0 在 t=5 空等（`·`），t=7 才做 `B4`。  
+Megatron 默认训练路径用的是上面的 **1F1B**，不是 GPipe。
 
-流水线 bubble 比例 ≈ `(PP-1) / num_microbatches = (2-1)/4 = 25%`
+阶段划分（1F1B）：
+
+- `F1` = microbatch 1 的前向；`B1` = microbatch 1 的反向  
+- **warm-up**：stage0 先推 `F1`（t=1）；stage1 warmup=0  
+- **稳态 1F1B**：交替 Forward/Backward（stage0：`F2 B1 F3 B2 F4 B3`；stage1：`F1 B1 ... F3 B3`）  
+- **cooldown**：收尾 Backward（stage0 的 `B4`；stage1 的 `F4 B4` 落在末尾两拍）
+
+流水线 bubble 比例（近似）≈ `(PP-1) / num_microbatches = (2-1)/4 = 25%`
 
 **每个 rank 在 `get_batch` 中的行为**：
 
