@@ -8,9 +8,9 @@
 
 在第 2 篇，我们到达了 `GPTModel.forward()` 的大门，但没有进去。这里面有三个让初学者最困惑的设计：
 
-1. **`TransformerConfig` 有 400+ 个字段**，怎么读？哪些字段最重要？
-2. **`ModuleSpec` 是什么？** 为什么不直接 `nn.Linear` 而是要用 Spec？
-3. **PP 分段之后，同一个 `GPTModel` 类在不同 GPU 上结构是不一样的**，这是怎么实现的？
+1. `TransformerConfig` **有 400+ 个字段**，怎么读？哪些字段最重要？
+2. `ModuleSpec` **是什么？** 为什么不直接 `nn.Linear` 而是要用 Spec？
+3. **PP 分段之后，同一个** `GPTModel` **类在不同 GPU 上结构是不一样的**，这是怎么实现的？
 
 读完本文，这三个问题都会有清晰的答案。
 
@@ -97,18 +97,24 @@ class GPTModel(LanguageModule):
             )
 ```
 
+
+
 ### 1.2 PP=4 时各 stage 的实际组件表
 
-| PP rank | `pre_process` | `post_process` | 拥有的组件 |
-|---------|---------------|----------------|-----------|
-| 0 | **True** | False | `embedding` + `rotary_pos_emb` + `decoder`（layers 0-7） |
-| 1 | False | False | `decoder`（layers 8-15） |
-| 2 | False | False | `decoder`（layers 16-23） |
-| 3 | False | **True** | `decoder`（layers 24-31） + `output_layer` |
+
+| PP rank | `pre_process` | `post_process` | 拥有的组件                                                  |
+| ------- | ------------- | -------------- | ------------------------------------------------------ |
+| 0       | **True**      | False          | `embedding` + `rotary_pos_emb` + `decoder`（layers 0-7） |
+| 1       | False         | False          | `decoder`（layers 8-15）                                 |
+| 2       | False         | False          | `decoder`（layers 16-23）                                |
+| 3       | False         | **True**       | `decoder`（layers 24-31） + `output_layer`               |
+
 
 **关键洞察**：`TransformerBlock`（即 `self.decoder`）在每个 PP stage 上都存在，但里面包含的层数不同（通过 `get_num_layers_to_build` 计算）。`embedding` 和 `output_layer` 是条件性的。
 
 ---
+
+
 
 ## 2. `_preprocess` 的详细逻辑：三条路径
 
@@ -150,7 +156,7 @@ def _preprocess(self, input_ids, position_ids, decoder_input=None, ...):
             sequence_len_offset, padding_mask)
 ```
 
-**`set_input_tensor` 的工作原理**：
+`set_input_tensor` **的工作原理**：
 
 当流水线并行调度（`schedules.py`）通过 P2P 从上一个 stage 接收到激活张量时，会调用：
 
@@ -166,12 +172,15 @@ model.set_input_tensor(recv_tensor)
 ### 2.1 SP 散列的时机细节
 
 Embedding 层可以在两个地方触发 SP scatter：
-1. **`LanguageModelEmbedding` 内部**：当 `reduce_scatter_embeddings=True` 时（仅在 RoPE 且无 position embedding 时启用），embedding 会直接输出 `[S/TP, B, H]` 格式的张量。
-2. **`_preprocess` 中**：当 `scatter_to_sequence_parallel=True` 但 embedding 没有内部 scatter 时，在这里手动散列。
+
+1. `LanguageModelEmbedding` **内部**：当 `reduce_scatter_embeddings=True` 时（仅在 RoPE 且无 position embedding 时启用），embedding 会直接输出 `[S/TP, B, H]` 格式的张量。
+2. `_preprocess` **中**：当 `scatter_to_sequence_parallel=True` 但 embedding 没有内部 scatter 时，在这里手动散列。
 
 默认情况下（`scatter_embedding_sequence_parallel=True`），embedding 会在 `LanguageModelEmbedding.forward` 内部完成 scatter，`_preprocess` 中的 if 分支不会被触发。
 
 ---
+
+
 
 ## 3. `_postprocess` 的关键分支
 
@@ -214,13 +223,17 @@ def _postprocess(self, hidden_states, labels, mtp_in_postprocess=None, ...):
     return loss   # [B, S]，每个位置的 CE loss
 ```
 
-**`parallel_output=True` 的意义**：
+`parallel_output=True` **的意义**：
 
 在训练时，`output_layer` 是 `ColumnParallelLinear`，默认 `gather_output=False`（即 `parallel_output=True`）。这意味着 logits 保持在 `[S, B, V/TP]` 的分片状态，不做 AllGather。`vocab_parallel_cross_entropy` 可以直接在这个分片上计算交叉熵，避免了将完整 vocab 的 logits 收集到每张卡上，节省显存和通信。
 
 ---
 
+
+
 ## 4. RoPE vs 学习型绝对位置编码：深度对比
+
+
 
 ### 4.1 学习型绝对位置编码（`learned_absolute`）
 
@@ -266,14 +279,16 @@ q_rotated[2i+1] =  q[2i] * sin(m*θ_i) + q[2i+1] * cos(m*θ_i)
 
 **对比表**：
 
-| 特性 | learned_absolute | RoPE | YaRN |
-|------|-----------------|------|------|
-| 位置信息注入层 | embedding | 每层 attention | 每层 attention |
-| 长度外推能力 | 无（截断到 max_seq_len） | 一定程度有（频率外推） | 显著增强（专为长度外推设计） |
-| 额外参数量 | `max_seq_len × H` | 0（无参数，纯计算） | 0（无参数） |
-| 相对位置感知 | 弱（绝对位置相减不等于相对位置）| 强（内积保持相对位置信息） | 强 |
-| 代表模型 | 原始 GPT-2、BERT | LLaMA、Mistral | Code LLaMA 长序列版本 |
-| Megatron 配置 | `position_embedding_type='learned_absolute'` | `'rope'` | `'yarn'` |
+
+| 特性          | learned_absolute                             | RoPE          | YaRN             |
+| ----------- | -------------------------------------------- | ------------- | ---------------- |
+| 位置信息注入层     | embedding                                    | 每层 attention  | 每层 attention     |
+| 长度外推能力      | 无（截断到 max_seq_len）                           | 一定程度有（频率外推）   | 显著增强（专为长度外推设计）   |
+| 额外参数量       | `max_seq_len × H`                            | 0（无参数，纯计算）    | 0（无参数）           |
+| 相对位置感知      | 弱（绝对位置相减不等于相对位置）                             | 强（内积保持相对位置信息） | 强                |
+| 代表模型        | 原始 GPT-2、BERT                                | LLaMA、Mistral | Code LLaMA 长序列版本 |
+| Megatron 配置 | `position_embedding_type='learned_absolute'` | `'rope'`      | `'yarn'`         |
+
 
 **YaRN 的关键参数**（在 `TransformerConfig` 中）：
 
@@ -284,15 +299,22 @@ yarn_beta_fast: int = 32   # 高频部分的动态缩放
 yarn_beta_slow: int = 1    # 低频部分的动态缩放
 ```
 
+
+
 ### 4.3 `position_embedding_type='none'` 的用途
 
 设置为 `'none'` 时，既不加学习型位置嵌入，也不应用 RoPE。主要用于：
+
 - 使用 ALiBi（Attention with Linear Biases）等其他位置编码方案
 - 某些不需要位置编码的实验性模型
 
 ---
 
+
+
 ## 5. `share_embeddings_and_output_weights`：跨 PP 共享权重
+
+
 
 ### 5.1 什么是权重共享
 
@@ -329,14 +351,20 @@ def setup_embeddings_and_output_layer(self):
         weight.shared_embedding = True
 ```
 
+
+
 ### 5.3 实际效果
 
-| 配置 | 参数量变化 | 显存节省 | 训练影响 |
-|------|-----------|---------|----------|
-| `share_embeddings=False`（默认） | 完整 `vocab_size × H` 在 stage 0 和最后 stage 各一份 | 无 | 无 |
-| `share_embeddings=True` | 逻辑上共享，但仍需在两端各保留一份副本（PP 场景） | PP=1 时节省 `vocab_size × H`，PP>1 时实际没有节省参数 | 需要额外的跨 stage AllReduce |
+
+| 配置                           | 参数量变化                                       | 显存节省                                     | 训练影响                   |
+| ---------------------------- | ------------------------------------------- | ---------------------------------------- | ---------------------- |
+| `share_embeddings=False`（默认） | 完整 `vocab_size × H` 在 stage 0 和最后 stage 各一份 | 无                                        | 无                      |
+| `share_embeddings=True`      | 逻辑上共享，但仍需在两端各保留一份副本（PP 场景）                  | PP=1 时节省 `vocab_size × H`，PP>1 时实际没有节省参数 | 需要额外的跨 stage AllReduce |
+
 
 ---
+
+
 
 ## 6. 激活重计算：选择性 vs 全量
 
@@ -365,21 +393,25 @@ recompute_modules: Optional[List[str]] = None
 # 可选: "core_attn", "mlp", "moe", "layernorm", "mla_up_proj", ...
 ```
 
-### 6.2 各配置的激活保存情况（同一套数字算到底）
 
-先固定一个 **Llama-2-70B 风格** 假设（后文所有 GB 都只用这组数，避免前后矛盾）：
 
-| 符号 | 取值 | 含义 |
-|------|------|------|
-| \(B\) | 1 | micro batch |
-| \(S\) | 4096 | sequence length |
-| \(H\) | 8192 | hidden size |
-| \(L\) | 80 | 层数（70B 是 ~80 层，不是 32） |
-| \(N_h\) | 64 | attention heads |
-| \(d\) | 128 | head dim（\(H/N_h\)） |
-| dtype | fp16 = 2 bytes | |
+### 6.2 各配置的激活保存情况
 
-**基本积木**（后面反复用）：
+先固定一个 **Llama-2-70B 风格** 假设：
+
+
+| 符号    | 取值             | 含义              |
+| ----- | -------------- | --------------- |
+| B     | 1              | micro batch     |
+| S     | 4096           | sequence length |
+| H     | 8192           | hidden size     |
+| L     | 80             | 层数（70B）         |
+| N_h   | 64             | attention heads |
+| d     | 128            | head dim（H/N_h） |
+| dtype | fp16 = 2 bytes |                 |
+
+
+**基本积木**：
 
 ```text
 一个 [S, B, H] 激活 = 4096 × 1 × 8192 × 2 B
@@ -393,42 +425,45 @@ recompute_modules: Optional[List[str]] = None
                = 2,147,483,648 B = 2.0 GiB / 层
 ```
 
-注意：旧文曾写「单层约 2GB」又写「注意力矩阵约 4GB」，还用了 \(N_h=32\)、\(L=32\)，三处互不一致。  
-正确对照是：**注意力矩阵本身就是约 2.0 GiB/层**（上式）；「整层其它激活」是另一笔账。
+**注意力矩阵本身就是约 2.0 GiB/层**（上式）；「整层其它激活」是另一笔账。
 
 #### 不重计算（`recompute_granularity=None`）时，一层大概存什么？
 
-| 类别 | 代表 shape | 每层约占用（fp16） |
-|------|------------|-------------------|
+
+| 类别                    | 代表 shape               | 每层约占用（fp16）                                      |
+| --------------------- | ---------------------- | ------------------------------------------------ |
 | 残差 / LN / 投影等「线性尺寸」激活 | 多个 `[S,B,H]` 及 FFN 中间态 | 约 **0.8–1.5 GiB**（随是否 SwiGLU、具体 checkpoint 边界略变） |
-| 注意力分数矩阵（若物化） | `[B,N_h,S,S]` | **2.0 GiB** |
-| **单层合计（朴素 attn）** | | **约 3 GiB 量级** |
-| **80 层合计（仅激活，粗估）** | | **约 200+ GiB 量级**（远超单卡；还需叠加参数/梯度/优化器状态） |
+| 注意力分数矩阵（若物化）          | `[B,N_h,S,S]`          | **2.0 GiB**                                      |
+| **单层合计（朴素 attn）**     |                        | **约 3 GiB 量级**                                   |
+| **80 层合计（仅激活，粗估）**    |                        | **约 200+ GiB 量级**（远超单卡；还需叠加参数/梯度/优化器状态）          |
+
 
 直觉：长序列下 **S² 项（注意力矩阵）往往是单层激活里最大的一块**；  
-「线性尺寸」激活随 \(S\) 一次方涨，注意力矩阵随 \(S^2\) 涨。
+「线性尺寸」激活随 S 一次方涨，注意力矩阵随 S^2 涨。
 
-> 现代 TE / FlashAttention 路径常常**根本不落盘完整 `[B,N_h,S,S]`**。下面谈 selective 时，把它理解为「避开注意力核心里最吃显存的中间状态」；数字上仍用上面 2.0 GiB 作为「若物化 S² 矩阵」的对照上限，方便建立数量级。
+> 现代 TE / FlashAttention 路径常常**根本不落盘完整** `[B,N_h,S,S]`。下面谈 selective 时，把它理解为「避开注意力核心里最吃显存的中间状态」；数字上仍用上面 2.0 GiB 作为「若物化 S² 矩阵」的对照上限，方便建立数量级。
+
+
 
 #### `selective` + `recompute_modules=['core_attn']`（推荐）
 
 行为：
 
 - **保留**：QKV 投影输出等，作为重算输入  
-- **不长期保存 / 反向时重算**：`core_attn`（`QK^T → softmax → ×V`）里的大块中间态  
+- **不长期保存 / 反向时重算**：`core_attn`（`QK^T → softmax → ×V`）里的大块中间态
 
 显存账（同一套假设）：
 
 ```text
 省下的主项 ≈ 注意力 S² 工作区
-            ≈ 2.0 GiB / 层   （不是 4 GiB，也不是「整层只有 2 GiB」那种含糊说法）
+            ≈ 2.0 GiB / 层
 
 相对「朴素整层 ~3 GiB」：
   约省 2.0 / 3 ≈ 60% 的单层激活
   （若底层已是 FlashAttention、本来就没存满 S²，实际节省会小于这个上限）
 ```
 
-80 层粗估：仅这一项就可能对应 **O(100 GiB)** 量级的差额（\(80 × 2.0\)），所以 selective 对长序列特别划算。
+80 层粗估：仅这一项就可能对应 **O(100 GiB)** 量级的差额（80 × 2.0），所以 selective 对长序列特别划算。
 
 #### `full` + `recompute_method='uniform'`
 
@@ -447,12 +482,14 @@ recompute_modules: Optional[List[str]] = None
 
 **读数口诀**（避免再混）：
 
-1. 先写出配置：\(B,S,H,N_h,L\)、dtype  
-2. 线性激活用 \(S·B·H·bytes\)（上例 64 MiB / 张）  
-3. 注意力矩阵用 \(B·N_h·S·S·bytes\)（上例 **2.0 GiB / 层**）  
-4. 整层 ≈ 线性类之和 +（是否物化的）注意力矩阵；不要用「S×B×H×4」这种未定义系数去「约等于 2GB」
+1. 先写出配置：B,S,H,N_h,L、dtype
+2. 线性激活用 S·B·H·bytes（上例 64 MiB / 张）
+3. 注意力矩阵用 B·N_h·S·S·bytes（上例 **2.0 GiB / 层**）
+4. 整层 ≈ 线性类之和 +（是否物化的）注意力矩阵
 
 ---
+
+
 
 ## 7. TransformerConfig：字段分组详解
 
@@ -462,14 +499,16 @@ recompute_modules: Optional[List[str]] = None
 
 ### 7.1 模型架构核心字段
 
-| 字段名 | 类型 | 默认值 | 含义 |
-|--------|------|--------|------|
-| `num_layers` | int | 0 | Transformer 层数（整个模型，非单 PP stage） |
-| `hidden_size` | int | 0 | 隐藏层维度 H |
-| `num_attention_heads` | int | 0 | 注意力头数 NH |
-| `num_query_groups` | Optional[int] | None→NH | GQA 的 KV 头组数（若 < NH 即 GQA） |
-| `ffn_hidden_size` | Optional[int] | None→4H | FFN 中间层维度（SwiGLU 时通常为 8H/3） |
-| `kv_channels` | Optional[int] | None→H/NH | 每个注意力头的维度 |
+
+| 字段名                   | 类型            | 默认值       | 含义                               |
+| --------------------- | ------------- | --------- | -------------------------------- |
+| `num_layers`          | int           | 0         | Transformer 层数（整个模型，非单 PP stage） |
+| `hidden_size`         | int           | 0         | 隐藏层维度 H                          |
+| `num_attention_heads` | int           | 0         | 注意力头数 NH                         |
+| `num_query_groups`    | Optional[int] | None→NH   | GQA 的 KV 头组数（若 < NH 即 GQA）       |
+| `ffn_hidden_size`     | Optional[int] | None→4H   | FFN 中间层维度（SwiGLU 时通常为 8H/3）      |
+| `kv_channels`         | Optional[int] | None→H/NH | 每个注意力头的维度                        |
+
 
 **自动填充逻辑**（在 `__post_init__` 中）：
 
@@ -485,26 +524,34 @@ if self.num_query_groups is None:
     self.num_query_groups = self.num_attention_heads
 ```
 
+
+
 ### 7.2 并行相关字段（继承自 ModelParallelConfig）
 
-| 字段名 | 含义 |
-|--------|------|
-| `tensor_model_parallel_size` | TP 并行度（`--tensor-model-parallel-size`） |
-| `pipeline_model_parallel_size` | PP 并行度 |
-| `virtual_pipeline_model_parallel_size` | VPP 虚拟流水线并行度 |
-| `sequence_parallel` | 是否开启 SP（需要 `tensor_model_parallel_size > 1`） |
-| `context_parallel_size` | CP 并行度 |
+
+| 字段名                                    | 含义                                           |
+| -------------------------------------- | -------------------------------------------- |
+| `tensor_model_parallel_size`           | TP 并行度（`--tensor-model-parallel-size`）       |
+| `pipeline_model_parallel_size`         | PP 并行度                                       |
+| `virtual_pipeline_model_parallel_size` | VPP 虚拟流水线并行度                                 |
+| `sequence_parallel`                    | 是否开启 SP（需要 `tensor_model_parallel_size > 1`） |
+| `context_parallel_size`                | CP 并行度                                       |
+
+
+
 
 ### 7.3 激活重计算（内存 vs 速度 tradeoff）
 
-| 字段名 | 含义 |
-|--------|------|
-| `fp16`/`bf16`/`fp8` | 数值精度（bf16 推荐，fp8 需 TE） |
-| `fp32_residual_connection` | 残差连接用 fp32（提升稳定性） |
-| `recompute_granularity` | `'full'`：重计算整层；`'selective'`：只重计算特定子模块 |
-| `recompute_method` | `'uniform'`：均匀分配；`'block'`：前 N 层重计算 |
-| `recompute_num_layers` | 每个 recompute 单元的层数 |
-| `recompute_modules` | selective 模式：重计算哪些子模块（默认 `['core_attn']`） |
+
+| 字段名                        | 含义                                        |
+| -------------------------- | ----------------------------------------- |
+| `fp16`/`bf16`/`fp8`        | 数值精度（bf16 推荐，fp8 需 TE）                    |
+| `fp32_residual_connection` | 残差连接用 fp32（提升稳定性）                         |
+| `recompute_granularity`    | `'full'`：重计算整层；`'selective'`：只重计算特定子模块    |
+| `recompute_method`         | `'uniform'`：均匀分配；`'block'`：前 N 层重计算       |
+| `recompute_num_layers`     | 每个 recompute 单元的层数                        |
+| `recompute_modules`        | selective 模式：重计算哪些子模块（默认 `['core_attn']`） |
+
 
 `recompute_granularity='full'` 在反向传播时重新执行前向，以时间换空间。70B 模型光激活就可能占数十 GB，重计算可以将峰值显存减少 60-80%，代价是增加约 30-40% 训练时间。
 
@@ -527,6 +574,8 @@ TransformerConfig
 
 ---
 
+
+
 ## 8. ModuleSpec：插件化装配机制
 
 文件：`/workspace/megatron/core/transformer/spec_utils.py`
@@ -541,6 +590,8 @@ class ModuleSpec:
     submodules: object = None     # 子模块的 spec（嵌套 Spec）
     metainfo: dict = {}           # 元信息（不用于构造）
 ```
+
+
 
 ### 8.2 `build_module` 算法
 
@@ -579,17 +630,20 @@ def build_module(spec_or_module, *args, **kwargs):
 
 ### 8.3 Local backend 与 TE backend 的具体类名对比
 
-| 模块角色 | Local backend（`LocalSpecProvider`） | TE backend（`TESpecProvider`） |
-|---------|--------------------------------------|-------------------------------|
-| QKV 投影 | `ColumnParallelLinear` | `TEColumnParallelLinear` |
-| 输出投影 | `RowParallelLinear` | `TERowParallelLinear` |
-| FFN 上投影 | `ColumnParallelLinear` | `TEColumnParallelLinear` （或 `TELayerNormColumnParallelLinear`，融合 LN） |
-| FFN 下投影 | `RowParallelLinear` | `TERowParallelLinear` |
-| 核心注意力 | `DotProductAttention` | `TEDotProductAttention`（支持 Flash Attention） |
-| LayerNorm | `RMSNorm` / `WrappedTorchNorm` | `TENorm`（融合 CUDA kernel） |
-| MLP（整体） | `MLP` | `TELayerNormMLP` / `TEFusedMLP`（融合 LN+Linear+GELU） |
+
+| 模块角色      | Local backend（`LocalSpecProvider`） | TE backend（`TESpecProvider`）                                         |
+| --------- | ---------------------------------- | -------------------------------------------------------------------- |
+| QKV 投影    | `ColumnParallelLinear`             | `TEColumnParallelLinear`                                             |
+| 输出投影      | `RowParallelLinear`                | `TERowParallelLinear`                                                |
+| FFN 上投影   | `ColumnParallelLinear`             | `TEColumnParallelLinear` （或 `TELayerNormColumnParallelLinear`，融合 LN） |
+| FFN 下投影   | `RowParallelLinear`                | `TERowParallelLinear`                                                |
+| 核心注意力     | `DotProductAttention`              | `TEDotProductAttention`（支持 Flash Attention）                          |
+| LayerNorm | `RMSNorm` / `WrappedTorchNorm`     | `TENorm`（融合 CUDA kernel）                                             |
+| MLP（整体）   | `MLP`                              | `TELayerNormMLP` / `TEFusedMLP`（融合 LN+Linear+GELU）                   |
+
 
 **如何选择**：
+
 - 开发/调试：使用 `get_gpt_layer_local_spec()`，不需要安装 TE，代码更透明
 - 生产训练：使用 `get_gpt_layer_with_transformer_engine_spec()`，性能更好
 
@@ -602,6 +656,8 @@ def get_gpt_layer_local_spec(...) -> ModuleSpec:
         submodules=get_gpt_layer_local_submodules(...)
     )
 ```
+
+
 
 ### 8.4 ModuleSpec 的嵌套结构举例（Local backend）
 
@@ -656,6 +712,8 @@ TransformerLayer
 
 ---
 
+
+
 ## 9. TransformerLayer 的单步计算拆解
 
 文件：`/workspace/megatron/core/transformer/transformer_layer.py`
@@ -691,6 +749,8 @@ TransformerLayer
   → hidden_states [S, B, H]
 ```
 
+
+
 ### 9.2 `_forward_mlp` 的步骤列表
 
 ```
@@ -719,20 +779,28 @@ TransformerLayer
 
 ---
 
+
+
 ## 10. 数值例子 A：seq=4096, mbs=2, TP=4, SP=on
+
+
 
 ### 配置
 
-| 参数 | 数值 |
-|------|------|
-| `hidden_size` (H) | 4096 |
-| `num_attention_heads` (NH) | 32 |
-| `num_query_groups` (nKV) | 8 |
-| `kv_channels` (head_dim) | 128 |
-| `ffn_hidden_size` (FFN) | 16384 |
-| `tensor_model_parallel_size` (TP) | 4 |
-| `batch_size` (B) | 2 |
-| `seq_length` (S) | 4096 |
+
+| 参数                                | 数值    |
+| --------------------------------- | ----- |
+| `hidden_size` (H)                 | 4096  |
+| `num_attention_heads` (NH)        | 32    |
+| `num_query_groups` (nKV)          | 8     |
+| `kv_channels` (head_dim)          | 128   |
+| `ffn_hidden_size` (FFN)           | 16384 |
+| `tensor_model_parallel_size` (TP) | 4     |
+| `batch_size` (B)                  | 2     |
+| `seq_length` (S)                  | 4096  |
+
+
+
 
 ### 10.1 Embedding 阶段（PP stage 0）
 
@@ -781,6 +849,8 @@ ReduceScatter（SP 模式下，代替 AllReduce）
 → [S/TP, B, H] = [1024, 2, 4096]   ← 回到 SP 分片状态
 ```
 
+
+
 ### 10.3 FFN 层形状变化（TP=4，SP=on，SwiGLU）
 
 ```
@@ -805,6 +875,8 @@ ReduceScatter（SP 模式）
 ```
 
 ---
+
+
 
 ## 11. 数值例子 B：seq=2048, mbs=2, TP=2, SP=on
 
@@ -833,6 +905,8 @@ vocab_parallel_cross_entropy 在分片 logits 上计算
 
 ---
 
+
+
 ## 12. VPP 层编号：全局层号 vs 局部层号
 
 文件：`/workspace/megatron/core/transformer/transformer_block.py`，第 332 行。
@@ -841,12 +915,14 @@ vocab_parallel_cross_entropy 在分片 logits 上计算
 
 32 层 / PP=4 / VPP=1（无 VPP）：
 
-| PP rank | 局部层号（在 TransformerBlock 内） | 全局层号 |
-|---------|----------------------------------|---------|
-| 0 | 0, 1, 2, 3, 4, 5, 6, 7 | 0-7 |
-| 1 | 0, 1, 2, 3, 4, 5, 6, 7 | 8-15 |
-| 2 | 0, 1, 2, 3, 4, 5, 6, 7 | 16-23 |
-| 3 | 0, 1, 2, 3, 4, 5, 6, 7 | 24-31 |
+
+| PP rank | 局部层号（在 TransformerBlock 内） | 全局层号  |
+| ------- | -------------------------- | ----- |
+| 0       | 0, 1, 2, 3, 4, 5, 6, 7     | 0-7   |
+| 1       | 0, 1, 2, 3, 4, 5, 6, 7     | 8-15  |
+| 2       | 0, 1, 2, 3, 4, 5, 6, 7     | 16-23 |
+| 3       | 0, 1, 2, 3, 4, 5, 6, 7     | 24-31 |
+
 
 全局层号 = `get_transformer_layer_offset(config, vp_stage=None, pp_rank) + 局部层号`
 
@@ -854,16 +930,18 @@ vocab_parallel_cross_entropy 在分片 logits 上计算
 
 32 层 / PP=4 / VPP=2：每个 PP rank 有 2 个 chunk（vp_stage=0 和 vp_stage=1），每个 chunk 4 层：
 
-| PP rank | vp_stage | 局部层号 | 全局层号 |
-|---------|----------|---------|---------|
-| 0 | 0 | 0,1,2,3 | **0-3** |
-| 1 | 0 | 0,1,2,3 | **4-7** |
-| 2 | 0 | 0,1,2,3 | **8-11** |
-| 3 | 0 | 0,1,2,3 | **12-15** |
-| 0 | 1 | 0,1,2,3 | **16-19** |
-| 1 | 1 | 0,1,2,3 | **20-23** |
-| 2 | 1 | 0,1,2,3 | **24-27** |
-| 3 | 1 | 0,1,2,3 | **28-31** |
+
+| PP rank | vp_stage | 局部层号    | 全局层号      |
+| ------- | -------- | ------- | --------- |
+| 0       | 0        | 0,1,2,3 | **0-3**   |
+| 1       | 0        | 0,1,2,3 | **4-7**   |
+| 2       | 0        | 0,1,2,3 | **8-11**  |
+| 3       | 0        | 0,1,2,3 | **12-15** |
+| 0       | 1        | 0,1,2,3 | **16-19** |
+| 1       | 1        | 0,1,2,3 | **20-23** |
+| 2       | 1        | 0,1,2,3 | **24-27** |
+| 3       | 1        | 0,1,2,3 | **28-31** |
+
 
 **VPP 的好处**：微批次 1 可以先在 PP0-chunk0 → PP1-chunk0 → ... → PP3-chunk0 流动，同时微批次 2 在 PP0-chunk0 上开始。bubble 比例从 `(PP-1)/N` 降低到 `(PP-1)/(N*VPP)` 左右。
 
@@ -878,6 +956,8 @@ global_layer_number = layer_number + get_transformer_layer_offset(
 
 ---
 
+
+
 ## 13. Multi-Token Prediction（MTP）简介
 
 文件：`/workspace/megatron/core/transformer/multi_token_prediction.py`
@@ -885,12 +965,16 @@ global_layer_number = layer_number + get_transformer_layer_offset(
 ### 13.1 MTP 的原理
 
 MTP（Multi-Token Prediction）是 DeepSeek-V3 引入的技术，将语言模型训练目标从"预测下一个 token"扩展到"同时预测接下来 D 个 token"。其优势是：
+
 1. 以更少的训练步数达到相同的模型质量（每步有效 token 数 × D）
 2. 推理时可以与 speculative decoding 结合，加速生成
+
+
 
 ### 13.2 Megatron 的 MTP 实现
 
 配置字段：
+
 ```python
 mtp_num_layers: Optional[int] = None   # MTP 预测的额外 token 数（即 D）
 mtp_loss_scaling_factor: float = 0.1   # MTP 损失的权重系数
@@ -905,6 +989,8 @@ MTP 模块 k（预测第 k+2 个 token）:
 ├── Transformer 层（通常只有 1 层）
 └── 共享 output head（与主模型 output_layer 共享权重）
 ```
+
+
 
 ### 13.3 MTP 在 GPTModel 中的位置
 
@@ -926,6 +1012,8 @@ total_loss = main_lm_loss + mtp_loss_scaling_factor × avg(mtp_losses[0..D-1])
 ```
 
 ---
+
+
 
 ## 14. gpt_builder 分支树
 
@@ -959,6 +1047,8 @@ gpt_builder(args)
 ```
 
 ---
+
+
 
 ## 15. 连接图：从 Config 到每一次矩阵乘法
 
@@ -1002,15 +1092,19 @@ GPTModel.__init__()
 
 ---
 
+
+
 ## 16. Debug 断点表
 
-| 断点位置 | 文件 | 目的 |
-|---------|------|------|
-| `GPTModel.__init__` 末尾 | `gpt_model.py` | 确认 embedding/output_layer 存在性，打印 `pre_process`/`post_process` |
-| `_preprocess` 的 SP scatter | `gpt_model.py` | 验证 SP 散列后的形状 `[S/TP, B, H]` |
-| `TransformerLayer._forward_attention` 的 linear_qkv 输出 | `transformer_layer.py` | 验证 QKV 形状与公式一致 |
-| `linear_proj` 后（AllReduce/RS 后） | `attention.py` | 验证 TP 聚合后恢复 `[S, B, H]` |
-| `_postprocess` 的 logits 计算 | `gpt_model.py` | 验证 logits 形状 `[S, B, vocab/TP]` |
+
+| 断点位置                                                  | 文件                     | 目的                                                            |
+| ----------------------------------------------------- | ---------------------- | ------------------------------------------------------------- |
+| `GPTModel.__init__` 末尾                                | `gpt_model.py`         | 确认 embedding/output_layer 存在性，打印 `pre_process`/`post_process` |
+| `_preprocess` 的 SP scatter                            | `gpt_model.py`         | 验证 SP 散列后的形状 `[S/TP, B, H]`                                   |
+| `TransformerLayer._forward_attention` 的 linear_qkv 输出 | `transformer_layer.py` | 验证 QKV 形状与公式一致                                                |
+| `linear_proj` 后（AllReduce/RS 后）                       | `attention.py`         | 验证 TP 聚合后恢复 `[S, B, H]`                                       |
+| `_postprocess` 的 logits 计算                            | `gpt_model.py`         | 验证 logits 形状 `[S, B, vocab/TP]`                               |
+
 
 **快速验证脚本**：
 
@@ -1030,17 +1124,21 @@ for name, p in model.named_parameters():
 
 ---
 
+
+
 ## 17. 课后练习
 
 **练习 1（形状计算）**：
 给定配置：`hidden_size=8192`, `num_attention_heads=64`, `num_query_groups=8`, `TP=8`
 计算：
+
 - 每个 TP rank 的 Q 头数
 - 每个 TP rank 的 KV 头数
 - `linear_qkv.weight` 的形状
 - `linear_proj.weight` 的形状
 
 **参考答案**：
+
 - Q 头数/TP rank = 64/8 = 8
 - KV 头数/TP rank = 8/8 = 1（GQA 8:1）
 - `linear_qkv.weight`: `[8192, (8+1+1)*128]` = `[8192, 1280]`（head_dim = 8192/64 = 128）
@@ -1060,11 +1158,14 @@ for name, p in model.named_parameters():
 
 ---
 
+
+
 ## 18. FAQ：10 个模型架构问题
 
 **Q1：GQA（Grouped Query Attention）是怎么在代码里实现的？**
 
 A：在 `SelfAttention` 内部，通过 `expand_qkv` 或 `repeat_kv` 将 K/V 的头数从 `nKV` 广播到 `NH`：
+
 ```python
 # 伪代码
 q: [B, NH, S, head_dim]
@@ -1074,23 +1175,23 @@ v = v.repeat_interleave(NH // nKV, dim=1)  # 广播 V
 attn = q @ k.transpose(-2, -1)  # [B, NH, S, S]
 ```
 
-**Q2：`parallel_output=True` 和 `parallel_output=False` 什么时候用哪个？**
+**Q2：**`parallel_output=True` **和** `parallel_output=False` **什么时候用哪个？**
 
 A：训练时用 `True`（默认），logits 保持分片，配合 `vocab_parallel_cross_entropy` 计算；推理时用 `False`（或通过 `runtime_gather_output=True` 临时覆盖），需要完整 vocab logits 来 argmax 采样。
 
-**Q3：`share_embeddings_and_output_weights` 是否影响 PP > 1 时的参数量？**
+**Q3：**`share_embeddings_and_output_weights` **是否影响 PP > 1 时的参数量？**
 
 A：参数量不变（PP > 1 时两端各有一份 embedding），但**参数一致性**由 AllReduce 保证，**梯度**也会被合并。实际上，PP > 1 时 `share_embeddings_and_output_weights` 的主要意义是梯度合并，而非节省参数。
 
-**Q4：RoPE 的 `rotary_base=10000` 代表什么？**
+**Q4：RoPE 的** `rotary_base=10000` **代表什么？**
 
 A：`rotary_base` 控制旋转频率的基础周期：`θ_i = 10000^(-2i/d)`。较大的 base 使得高维度的旋转频率更慢，从而能表示更长的相对位置信息。LLaMA-2 使用 10000，LLaMA-3 使用 500000（更适合长序列）。
 
-**Q5：`position_embedding_type='none'` 会怎样？**
+**Q5：**`position_embedding_type='none'` **会怎样？**
 
 A：`LanguageModelEmbedding` 不会创建 `position_embeddings`，embedding forward 只有词嵌入：`output = word_embeddings(input_ids)`。这种模式通常与自定义位置编码（如 ALiBi 通过注意力 mask 施加）配合使用。
 
-**Q6：`mtp_num_layers=1` 和 `mtp_num_layers=3` 的区别是什么？**
+**Q6：**`mtp_num_layers=1` **和** `mtp_num_layers=3` **的区别是什么？**
 
 A：`mtp_num_layers` 决定了额外预测的 token 数 D。`=1` 表示额外预测下一个 token（共预测 2 个）；`=3` 则额外预测 3 个 token（共 4 个），损失是所有深度 MTP 损失的平均。DeepSeek-V3 使用了 `mtp_num_layers=1`。
 
@@ -1098,19 +1199,21 @@ A：`mtp_num_layers` 决定了额外预测的 token 数 D。`=1` 表示额外预
 
 A：完整序列。SP 仅在 LayerNorm 和 Dropout 阶段保持序列切分；进入注意力和 FFN 计算前，会先 AllGather 完整序列（通过 `gather_from_sequence_parallel_region`）；计算完后再 ReduceScatter 回分片状态。这是 SP 不需要 Ring Attention 的原因——注意力仍然是全局的。
 
-**Q8：如果 `num_query_groups` 不能被 TP 整除会怎样？**
+**Q8：如果** `num_query_groups` **不能被 TP 整除会怎样？**
 
 A：构建模型时会报错，因为每个 TP rank 必须有完整数量的 KV 头（不能有 0.5 个 KV 头）。规则：`num_query_groups % TP == 0`。例如 nKV=4, TP=8 是不合法的（4 < 8）。这时应考虑降低 TP 或增加 nKV。
 
-**Q9：`output_layer` 的 `bias=False` 有什么含义？**
+**Q9：**`output_layer` **的** `bias=False` **有什么含义？**
 
 A：语言模型的输出层通常不加 bias（来自 Press & Wolf 2017 的实验表明 bias 对困惑度影响很小，且会增加每步更新的通信量）。大部分现代 LLM（LLaMA, GPT-3, Falcon 等）都不使用 output bias。
 
-**Q10：什么是 `skip_weight_param_allocation`，在什么时候触发？**
+**Q10：什么是** `skip_weight_param_allocation`**，在什么时候触发？**
 
 A：当 `pre_process and share_embeddings_and_output_weights` 时，`output_layer` 的权重指向 `embedding.word_embeddings.weight`，不需要再分配一块新内存，所以 `skip_weight_param_allocation=True`。只有当 PP stage 同时持有 embedding 和 output_layer（即 PP=1 或 pre_process=post_process=True）时，这个参数才为 True。
 
 ---
+
+
 
 ## 19. 本文小结
 
