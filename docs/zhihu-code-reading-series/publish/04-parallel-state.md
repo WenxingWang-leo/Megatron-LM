@@ -383,6 +383,55 @@ expert_DP = world_size / (expert_TP × EP × PP)
 → `expert_DP = 64/(1×8×2)=4`  
 含义：expert 权重不再做 TP 切分，改为更细的 EP；expert 副本数（expert_DP）与 dense DP 也可以不同。
 
+### 7.1.1 `expert_DP` 到底做什么？和 dense `DP` 有何不同？
+
+一句话：
+
+> **dense DP**：同步「所有副本上完全相同」的 Attention/非专家 MLP 等权重的梯度。  
+> **expert_DP**：同步「持有同一批 local experts 的那些副本」上的 expert 权重梯度。
+
+#### 为什么要两套 DP？
+
+引入 **EP** 之后，不同卡上的 expert 权重**不再相同**：
+
+- EP rank 0 可能持有 expert `[0..7]`
+- EP rank 1 持有 expert `[8..15]`
+- …
+
+对这些参数再拿「全体 dense DP 组」去做 AllReduce / ReduceScatter 是错的——你会把**不同 expert** 的梯度搅在一起。  
+正确做法是：只在「拥有同一组 local experts 的副本」之间同步，这个副本集合的大小就是 **`expert_DP`**，进程组常叫 `expt_dp` / `intra_expt_dp_group`。
+
+#### 和 dense DP 的对比
+
+| | dense DP | expert_DP |
+|--|----------|-----------|
+| 同步对象 | Attention、非专家 MLP、embedding 等（`param.allreduce=True`） | MoE expert 权重（通常 `allreduce=False` / `is_expert_parallel`） |
+| 进程组 | `dp` 或 `dp_cp`（大小约 `DP` 或 `DP×CP`） | `expt_dp`（大小 `expert_DP`） |
+| 组内权重是否相同 | 是（同一份 dense 副本） | 是（同一批 local experts 的副本）；**跨 EP rank 则不同** |
+| 优化器 | DistOpt 走 `intra_dp_cp` + `buffers` | 常再挂一条 DistOpt，走 `intra_expt_dp` + `expert_parallel_buffers`（见 `get_megatron_optimizer`） |
+| 公式 | `world/(TP×PP×CP)` | `world/(expert_TP×EP×PP)` |
+
+#### 关联（别当成完全无关的两套世界）
+
+1. **同一套 `world_size` 切出来的**：卡还是那些卡；只是 dense 路径与 expert 路径用不同 mask 编组。  
+2. **PP 组必须一致**：源码断言 expert / non-expert 的 PP ranks 相同，保证流水线 P2P 仍对齐。  
+3. **可以不相等**：当 `expert_TP ≠ TP` 或 EP 吃掉一部分并行度时，`expert_DP` 往往 **小于** dense `DP`（算例 A：DP=8 而 expert_DP=2）。  
+4. **语义同类**：都是「数据并行」——用不同 batch（或不同 token 路由结果）训练**相同那份权重副本**，再平均梯度；差别只在「什么叫相同副本」。  
+5. **和 EP 的分工**：  
+   - **EP**：把不同 expert **切开**到不同卡（模型并行的一种）  
+   - **expert_DP**：把「切完后的同一份 local-expert 分片」**复制**多份，在副本间做梯度同步  
+
+一张关系简图：
+
+```text
+全体 GPU
+  ├─ dense 路径：按 (TP, CP, DP, PP) 编组
+  │     └─ dense 权重在 DP（×CP）副本间 AllReduce/RS
+  └─ expert 路径：按 (expert_TP, EP, expert_DP, PP) 编组
+        ├─ EP：不同卡持有不同 expert
+        └─ expert_DP：持有相同 local experts 的卡之间同步梯度
+```
+
 ### 7.2 EP 约束：cp 必须为 1
 
 RankGenerator 中有明确断言 `ep==1 or cp==1`。EP 组的 AlltoAll 通信需要在同一 PP stage 内的 EP rank 之间进行，而 CP 的 KV 交换也需要跨 rank 通信。两者同时启用会使通信拓扑图出现循环依赖，调度器无法安全地安排 kernel 执行顺序。因此代码强制：若 EP > 1，则 expert_decoder_rank_generator 中 cp=1。
