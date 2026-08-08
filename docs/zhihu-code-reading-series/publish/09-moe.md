@@ -12,11 +12,14 @@
 > - `megatron/core/distributed/finalize_model_grads.py`  
 >
 > **上一篇**：[精读 Megatron 源码（8）：数据管线、DistOpt、Dist Checkpoint](./08-data-optim-ckpt.md)  
+> **EP 概念专题（建议先读）**：[精读 Megatron 源码（11）：专家并行 EP 完全指南](./11-expert-parallel.md)  
 > **下一篇**：[精读 Megatron 源码（10）：从读通主路径到能改框架](./10-advanced.md)
 
 ---
 
-Mixture of Experts（MoE）是当前大模型最热门的架构之一：用稀疏激活替代密集 MLP，实现"参数量增大、计算量不增大"。但 MoE 的分布式实现极其复杂——不同于 TP/PP/DP，它引入了全新的 **Expert Parallelism（EP）**，以及专门的通信原语（AllToAll vs AllGather）。本篇完整精读 Megatron 的 MoE 实现。
+Mixture of Experts（MoE）是当前大模型最热门的架构之一：用稀疏激活替代密集 MLP，实现"参数量增大、计算量不增大"。但 MoE 的分布式实现极其复杂——不同于 TP/PP/DP，它引入了全新的 **Expert Parallelism（EP）**，以及专门的通信原语（AllToAll vs AllGather）。
+
+若你对「EP 到底切什么、和 DP / expert_DP 什么关系」仍模糊，请先读独立专题 **[第 11 篇](./11-expert-parallel.md)**，再回本篇看 Router / Dispatcher / 负载均衡。本篇在 EP 拓扑之上，完整精读 Megatron 的 MoE 算法与实现。
 
 ---
 

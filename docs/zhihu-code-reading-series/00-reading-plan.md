@@ -2,7 +2,7 @@
 
 > 面向：有 PyTorch 与分布式训练基础、想系统读通 NVIDIA Megatron 源码的工程师。  
 > 仓库版本参考：本仓库 `main` 分支（Megatron Core ~0.15+）。  
-> 配套产出：同目录下 10 篇知乎风格源码导读文章（`01`–`10`）。
+> 配套产出：同目录下知乎风格源码导读文章（`01`–`10` 主线 + `11` EP 专题；成稿在 `publish/`）。
 
 ---
 
@@ -128,15 +128,18 @@ flowchart TD
 
 **检查点**：解释 DistOpt 与 FSDP 分别分片什么；dist checkpoint 如何做到「换并行度加载」。
 
-### 阶段 5：MoE / CP / 进阶（按需 3–7 天）→ 文章 09、10
+### 阶段 5：MoE / CP / 进阶（按需 3–7 天）→ 文章 11、09、10
 
 | 优先级 | 主题 | 入口 |
 |--------|------|------|
-| P0 | MoE + EP | `transformer/moe/moe_layer.py`、`router.py`、`token_dispatcher.py`、`docs/user-guide/features/moe.md` |
+| P0 | **先读 EP 概念**（文章 11） | `parallel_state` expert generator、`BaseMoELayer.local_expert_indices`、AlltoAll 直觉 |
+| P0 | MoE 算法与实现（文章 09） | `transformer/moe/moe_layer.py`、`router.py`、`token_dispatcher.py`、`docs/user-guide/features/moe.md` |
 | P0 | Context Parallel | `docs/user-guide/features/context_parallel.md` + attention 中 CP 路径 |
 | P1 | FSDP | `distributed/fsdp/`、`docs/user-guide/features/megatron_fsdp.md` |
 | P1 | 推理 | `megatron/core/inference/README.md` |
 | P2 | RL / 多模态 / Mamba | `megatron/rl/`、`examples/multimodal/`、`models/mamba/` |
+
+**检查点（EP）**：能区分 EP / dense DP / expert_DP；给定 `num_experts` 与 EP 写出每卡 `local_expert_indices`；说出 dispatch/combine 各通信什么。
 
 ---
 
@@ -199,8 +202,9 @@ flowchart TD
 | 06 | 流水线并行：1F1B 与微批次调度 | 阶段 3 PP |
 | 07 | 数据并行：DDP、梯度桶与 finalize | 阶段 3 DP |
 | 08 | 数据管线、DistributedOptimizer 与 Dist Checkpoint | 阶段 4 |
-| 09 | MoE：Router、Token Dispatcher 与专家并行 | 阶段 5 MoE |
+| 09 | MoE：Router、Token Dispatcher 与负载均衡 | 阶段 5 MoE |
 | 10 | 进阶路线：CP、推理、RL 与如何继续深挖 | 阶段 5 收束 |
+| 11 | 专家并行 EP：切分对象、Token 迁移、与 DP 关系 | 阶段 5 前置专题（建议先于 09） |
 
 建议发布节奏：每周 1–2 篇；每篇末尾留「下一篇预告 + 本周作业」。
 

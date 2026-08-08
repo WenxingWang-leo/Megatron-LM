@@ -385,6 +385,8 @@ expert_DP = world_size / (expert_TP × EP × PP)
 
 ### 7.1.1 `expert_DP` 到底做什么？和 dense `DP` 有何不同？
 
+> **扩展阅读**：若要对 EP 本身（切分对象、AlltoAll、与 DP 的对照）做完整概念精读，见独立专题 [第 11 篇：专家并行 EP](./11-expert-parallel.md)。
+
 一句话：
 
 > **dense DP**：同步「所有副本上完全相同」的 Attention/非专家 MLP 等权重的梯度。  

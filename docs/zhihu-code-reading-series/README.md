@@ -4,7 +4,7 @@
 
 ## 优先读这里（精通级成稿）
 
-→ **[`publish/`](./publish/)**（约 **9600+ 行**精读正文，十篇知乎成稿，单篇约 900–1100 行）
+→ **[`publish/`](./publish/)**（约 **10000+ 行**精读正文；核心十篇 + EP 独立专题）
 
 | 篇 | 内容 |
 |----|------|
@@ -16,8 +16,9 @@
 | 06 | PP 1F1B 时间线 + P2P + VPP |
 | 07 | DDP buffer / Bucket / finalize 八步 |
 | 08 | Dataset / DistOpt / Dist Checkpoint |
-| 09 | MoE Router / Dispatcher / EP |
+| 09 | MoE Router / Dispatcher / 负载均衡 |
 | 10 | CP/推理/RL/贡献与第二轮深挖项目 |
+| 11 | **EP 独立专题**：切分对象、AlltoAll、与 DP/expert_DP 关系 |
 
 索引与发布说明：[`publish/README.md`](./publish/README.md)
 
@@ -26,7 +27,7 @@
 | 文件 | 用途 |
 |------|------|
 | [`00-reading-plan.md`](./00-reading-plan.md) | 分阶段自学计划、必读清单、完成标准 |
-| `01`–`10`（本目录根下） | 早期提纲笔记；**正式精读请用 `publish/`** |
+| `01`–`11`（本目录根下） | 早期提纲笔记；**正式精读请用 `publish/`** |
 
 ## 打开方式（Agent Window）
 
