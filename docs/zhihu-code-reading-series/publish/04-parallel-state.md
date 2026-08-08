@@ -164,34 +164,67 @@ def decompose(index, shape, stride=None):
 
 场景：world=8，order="tp-dp-pp"，parallel_size=[2,2,2]，token="dp"（mask=[False,True,False]）
 
+#### 先澄清：`parallel_size=[2,2,2]` 里每个数字是什么
+
+```text
+order          = "tp-dp-pp"
+parallel_size  = [TP, DP, PP] = [2, 2, 2]
+world_size     = 2 × 2 × 2 = 8
 ```
-masked_shape   = [2]    （仅 dp）
-unmasked_shape = [2, 2] （tp, pp）
+
+这里的 **`DP=2` 不是「有 2 个 DP 通信组」**，而是：
+
+| 说法 | 含义 | 本例数值 |
+|------|------|----------|
+| **并行度 / group size** | **每个** DP 进程组里有多少个 rank | `DP = 2` → 每组 **2** 个 rank |
+| **组的个数** | 一共要建多少个这样的 DP 组 | `world / DP = 8/2 = 4` 组 |
+| 等价看法 | 每个 (tp_rank, pp_rank) 对应一个 DP 组 | `TP × PP = 2×2 = 4` 组 |
+
+源码注释也写得很直白（`parallel_state.py`）：
+
+> `dp_group`：**tp_size × pp_size 个组，每组 dp_size 个 ranks**
+
+所以若你期待「每组 4 个 rank」，那对应的是 **`DP=4`**（例如 world=8 且 TP=PP=1），不是本例的 `DP=2`。
+
+直觉：同一 DP 组 =「**同一 TP 分片、同一 PP stage**、但吃不同数据的副本」。  
+TP、PP 把模型切成 `TP×PP` 块「模型碎片」，每一块碎片都要有一套 DP 副本去同步梯度 → 所以有 `TP×PP` 个 DP 组；每组大小才是 `DP`。
+
+```text
+错误理解:  DP=2  →  2 个组 × 每组 4 ranks
+正确理解:  DP=2  →  每组 2 ranks，共 world/DP = 4 个组
+```
+
+#### 逐步执行
+
+```
+masked_shape   = [2]    （仅 dp）→ 决定「组内有几个 rank」= 2
+unmasked_shape = [2, 2] （tp, pp）→ 决定「有几个组」= 2×2 = 4
 global_stride  = prefix_product([2,2,2]) = [1, 2, 4, 8]
 masked_stride  = [2]    （dp 的步幅，即 tp 的 size=2）
 unmasked_stride = [1, 4] （tp 和 pp 的步幅）
 
-group_size = prefix_product([2])[-1] = 2
-num_of_group = 8 // 2 = 4
+group_size = prefix_product([2])[-1] = 2      # = DP
+num_of_group = 8 // 2 = 4                     # = TP×PP
 
 group_index=0: decompose(0, [2,2]) → [0,0]  (tp_rank=0, pp_rank=0)
   rank_in_group=0: decompose(0, [2]) → [0]  (dp_rank=0)
     rank = 0*2 + 0*1 + 0*4 = 0
   rank_in_group=1: decompose(1, [2]) → [1]  (dp_rank=1)
     rank = 1*2 + 0*1 + 0*4 = 2
-  → group[0] = [0, 2]  ✓ (tp=0, pp=0, dp=0/1)
+  → group[0] = [0, 2]  ✓ 同一碎片 (tp=0,pp=0) 的 2 个数据副本
 
 group_index=1: decompose(1, [2,2]) → [1,0]  (tp_rank=1, pp_rank=0)
-  → group[1] = [1, 3]  ✓ (tp=1, pp=0)
+  → group[1] = [1, 3]  ✓ 另一块 TP 分片，自己的 DP 组（也是 2 ranks）
 
 group_index=2: decompose(2, [2,2]) → [0,1]  (tp_rank=0, pp_rank=1)
-  → group[2] = [4, 6]  ✓ (tp=0, pp=1)
+  → group[2] = [4, 6]  ✓
 
 group_index=3: decompose(3, [2,2]) → [1,1]  (tp_rank=1, pp_rank=1)
-  → group[3] = [5, 7]  ✓ (tp=1, pp=1)
+  → group[3] = [5, 7]  ✓
 ```
 
-结果 `[[0,2],[1,3],[4,6],[5,7]]` 与第 4.2 节的 DP 组手工结果完全吻合。
+结果：`[[0,2],[1,3],[4,6],[5,7]]` —— **4 个 DP 组 × 每组 2 ranks**，与上面「`DP=2` = 组大小」完全一致。  
+若把全世界 8 卡误当成「一个大 DP 组」，就会期望每组 4 或 8 个 rank；那是把 TP/PP 分片也错误地并进同一个梯度 AllReduce 了。
 
 ---
 
