@@ -205,11 +205,12 @@ pretrain_gpt.py  (__main__)
 
 **理由**：并行之间有依赖：TP 假设 PP 已完成进程组划分；DP 依赖 TP+PP 决定 DP rank。按此顺序读，依赖关系自然清晰。
 
-### Phase 3：进阶专题（第 8-10 篇）
+### Phase 3：进阶专题（第 8–11 篇）
 
 8. **第 8 篇（优化器与 Checkpoint）**：DistributedOptimizer 内部、ShardedTensor 格式
-9. **第 9 篇（MoE）**：Expert 路由、All-to-All 通信、EP 分组
-10. **第 10 篇（前沿扩展）**：CP、FP8、speculative decoding、multi-token prediction
+9. **第 11 篇（EP 专题，建议先于 09）**：专家并行切什么、Token AlltoAll、与 DP/expert_DP
+10. **第 9 篇（MoE）**：Expert 路由、Dispatcher 实现、负载均衡
+11. **第 10 篇（前沿扩展）**：CP、FP8、speculative decoding、multi-token prediction
 
 ---
 
