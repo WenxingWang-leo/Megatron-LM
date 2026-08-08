@@ -125,7 +125,8 @@ def generate_masked_orthogonal_rank_groups(
 ```python
 def prefix_product(a, init=1):
     """计算前缀积，结果比输入长 1（第 0 项为 init）。
-    例如: [2, 3, 4] → [1, 2, 6, 24]"""
+    例如: [2, 3, 4] → [1, 2, 6, 24]
+         [2, 3]    → [1, 2, 6]"""
     r = [init]
     for v in a:
         init = init * v
@@ -134,11 +135,28 @@ def prefix_product(a, init=1):
 
 def decompose(index, shape, stride=None):
     """把标量 index 按 stride 分解为各维坐标。
-    例如: index=5, shape=[2,3], stride=[1,2]
-         → idx = [(5//1)%2, (5//2)%3] = [1, 2]"""
+
+    默认 stride = prefix_product(shape)，长度 = len(shape)+1。
+    例如 shape=[2,3] → stride=[1, 2, 6]。
+
+    真正参与计算的只有 stride 的前 len(shape) 项（即 stride[:-1]）：
+      zip(shape, stride) 会在较短序列处停住，末尾的 stride[-1]
+      （这里是 6 = 2*3，即该 shape 的“体积”）根本用不到。
+
+    例 1: index=5, shape=[2,3], stride=[1,2,6]
+         zip 只用到 (s,d)= (2,1), (3,2)
+         → idx = [(5//1)%2, (5//2)%3] = [1, 2]
+         校验: 1*1 + 2*2 = 5
+
+    例 2: index=2, shape=[2,3], stride=[1,2,6]
+         → idx = [(2//1)%2, (2//2)%3] = [0, 1]
+         校验: 0*1 + 1*2 = 2
+    """
     if stride is None:
-        stride = prefix_product(shape)
+        stride = prefix_product(shape)          # 长度 len(shape)+1
     idx = [(index // d) % s for s, d in zip(shape, stride)]
+    # 源码随后 assert: sum(idx[i] * stride[i] for i in range(len(shape))) == index
+    # 即只用 stride[:-1]，不用 stride[-1]
     return idx
 ```
 
