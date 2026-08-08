@@ -28,12 +28,33 @@ DP 的计算公式（不含 EP）为：
 DP = world_size / (TP × PP × CP)
 ```
 
-EP 不在这个公式里，因为 EP 复用 DP 分组（expert data parallel），并行度关系为：
+MoE 专家层还有一套**独立**的并行度（详见第 7 节）。先记住一个名字：
 
-```
-expert_data_parallel_size = world_size / (expert_TP × EP × PP)
+| 名字 | 源码参数 | 含义 |
+|------|----------|------|
+| **expert_TP** | `expert_tensor_parallel_size` | **只作用于 MoE expert 权重**的张量并行度 |
+| EP | `expert_model_parallel_size` | 专家并行：不同卡持有不同 expert |
+| expert_DP | `expert_data_parallel_size` | 专家侧的数据并行度（推出来的） |
+
+```text
+expert_DP = world_size / (expert_TP × EP × PP)
 ```
 
+**`expert_TP` 从哪来？**
+
+1. CLI / 配置项：`--expert-tensor-parallel-size`（对应 `args.expert_tensor_parallel_size`）  
+2. 若未指定（`None`），源码会**默认等于普通 TP**：
+
+```python
+# parallel_state.initialize_model_parallel / arguments.validate_args
+if expert_tensor_parallel_size is None:
+    expert_tensor_parallel_size = tensor_model_parallel_size
+```
+
+3. 因此多数情况下 `expert_TP == TP`，公式看起来像 `world/(TP×EP×PP)`；  
+   但 MoE 常见做法是把 expert_TP 设得更小（官方 MoE README 常建议细粒度 MoE 用 `expert_TP=1`），把省下的卡拿去加大 EP。
+
+注意：公式分母里是 **expert_TP**，不是 dense 层的 TP；也**不含 CP**（expert 路径建组时 `cp=1`）。  
 CP 复制权重：CP 内的 rank 持有完全相同的权重，不同的是它们处理不同的序列分片；因此 CP 组的梯度必须做 AllReduce，Megatron 把 CP 组"搭"在 DP 组上，合并为 `dp-cp` 联合组以方便 SHARP 优化（详见第 6 节）。
 
 ---
@@ -306,7 +327,35 @@ expert_decoder_rank_generator = RankGenerator(
 )
 ```
 
-### 7.1 expert_data_parallel_size 的计算
+### 7.1 `expert_TP` 是什么，又如何推出 `expert_DP`
+
+Dense Attention/MLP 用 `tensor_model_parallel_size`（常称 TP）切分 QKV、FFN 等。  
+MoE 的 **expert 线性层**可以另选一套张量并行度，源码名叫：
+
+```text
+expert_tensor_parallel_size   # 文中简称 expert_TP
+```
+
+| 对比 | dense TP | expert_TP |
+|------|----------|-----------|
+| 作用对象 | Attention / 非专家 MLP 等 | MoE expert 内部的 Column/Row 线性层 |
+| 配置 | `--tensor-model-parallel-size` | `--expert-tensor-parallel-size` |
+| 默认 | 必填/显式配置 | **`None` → 自动等于 dense TP** |
+| 常见 MoE 选择 | 如 TP=2/4/8 | 常设为 **1**（专家只靠 EP 切分，减少 expert 内通信） |
+
+源码默认赋值：
+
+```python
+# megatron/core/parallel_state.py
+if expert_tensor_parallel_size is None:
+    expert_tensor_parallel_size = tensor_model_parallel_size
+
+# megatron/training/arguments.py 里同样有：
+# if args.expert_tensor_parallel_size is None:
+#     args.expert_tensor_parallel_size = args.tensor_model_parallel_size
+```
+
+有了 `expert_TP` 后，专家侧数据并行度：
 
 ```python
 # megatron/core/parallel_state.py  第 783-790 行
@@ -316,9 +365,23 @@ expert_tensor_model_pipeline_parallel_size = (
 expert_data_parallel_size = world_size // expert_tensor_model_pipeline_parallel_size
 ```
 
-公式：`expert_DP = world_size / (expert_TP × EP × PP)`
+即：
 
-**注意** `expert_TP` 默认等于 `tensor_model_parallel_size`（非专家的 TP），但可以通过 `expert_tensor_parallel_size` 参数覆盖（例如 MoE 专家层用更小的 TP，以便用更多 GPU 做 EP）。
+```text
+expert_DP = world_size / (expert_TP × EP × PP)
+```
+
+分母**没有 CP**：expert `RankGenerator` 里写死 `cp=1`（见下一小节）。
+
+**算例 A（expert_TP 跟 dense TP 相同）**  
+`world=64, TP=4, expert_TP=4（默认）, EP=4, PP=2, CP=1`  
+→ dense `DP = 64/(4×2×1)=8`  
+→ `expert_DP = 64/(4×4×2)=2`  
+
+**算例 B（把 expert_TP 降为 1，腾出卡给 EP）**  
+`world=64, TP=4, expert_TP=1, EP=8, PP=2`  
+→ `expert_DP = 64/(1×8×2)=4`  
+含义：expert 权重不再做 TP 切分，改为更细的 EP；expert 副本数（expert_DP）与 dense DP 也可以不同。
 
 ### 7.2 EP 约束：cp 必须为 1
 
