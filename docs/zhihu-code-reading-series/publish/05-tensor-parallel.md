@@ -8,10 +8,13 @@
 
 张量并行（Tensor Parallelism，TP）把单个权重矩阵沿某个维度切开，分散到多个 GPU 上，每个 GPU 只做部分 GEMM，最后用通信原语把结果拼回来。它的优势是显存占用随 TP 线性下降，代价是每层都需要额外的集体通信。
 
-最重要的数学事实：矩阵乘法 `Y = XA` 有两种等价切分方式：
+最重要的数学事实：矩阵乘法 `Y = XA`（此处 A 为数学布局 `[in, out]`；PyTorch `nn.Linear` 存的是 `[out, in]`，算的是 `X @ W.T`）有两种等价切分方式：
 
-- **按列切分 A**（Column Parallel）：`Y = X [A_1 | A_2 | ... | A_p]` → 每个 GPU 算 `Y_i = X A_i`，结果需要 AllGather。
-- **按行切分 A**（Row Parallel）：`Y = [X_1, X_2, ..., X_p] [A_1; A_2; ...; A_p]^T` → 每个 GPU 算 `Y_i = X_i A_i^T`，结果需要 AllReduce。
+- **按列切分 A**（Column Parallel）：`A = [A_1 | A_2 | ... | A_p]`，`Y_i = X A_i`，再在最后一维拼接（或 AllGather）。
+- **按行切分 A**（Row Parallel）：`A = [A_1; A_2; ...; A_p]`（沿 **第一维 / 输入维** 切开），同时 `X = [X_1 | X_2 | ... | X_p]`（沿最后一维切开），则  
+  `Y = X A = Σ_i X_i A_i`。每个 GPU 算 `Y_i = X_i A_i`，再 **AllReduce 求和**（不是拼接）。
+
+> 注意：源码注释里的 `A = transpose([A_1 .. A_p])` 是在兼顾 PyTorch 权重转置存储；数学上就是上面的「A 按行块堆叠、X 按列块切开、局部 GEMM 再求和」。**不是** `X_i A_i^T`。
 
 Megatron 的设计是**把 ColumnParallelLinear 和 RowParallelLinear 串联**，中间无需 AllGather/AllReduce，从而把通信次数从每层 2 次降到每层 1 次。
 
@@ -19,34 +22,52 @@ Megatron 的设计是**把 ColumnParallelLinear 和 RowParallelLinear 串联**�
 
 ## 2. Y=XA 切分图解（ASCII）
 
-### 2.1 Column Parallel：A 沿列切分
+下面用 FFN 的一对线性层举例（与后文 §8 数值例一致）：先 Column（`H → 4H`），再 Row（`4H → H`）。设 TP=`p`。
+
+### 2.1 Column Parallel：A 沿列切分（FFN 第一层）
 
 ```
-输入 X: [B, S, H]    权重 A: [H, 4H]
+输入 X: [B, S, H]     数学权重 A: [H, 4H]
+                      每卡 A_i:   [H, 4H/p]
 
-           ┌─ A_0 [H, H] ─┐
-X ──── TP  ├─ A_1 [H, H] ─┤  ──→  [Y_0 | Y_1 | ... | Y_p]
-           └─ A_p [H, H] ─┘
+           ┌─ A_0 [H, 4H/p] ─┐
+X ──── TP  ├─ A_1 [H, 4H/p] ─┤  ──→  Y_i = X @ A_i
+           └─ A_{p-1} ...   ─┘
 
-每个 GPU 算: Y_i = X @ A_i,   shape: [B, S, H]
-全局结果:  Y = [Y_0 | Y_1 ... Y_p],  shape: [B, S, 4H]
-
-通信: gather_output=True 时做 AllGather，否则保持分片输出
+每个 GPU 算: Y_i = X @ A_i,   shape: [B, S, 4H/p]
+若 gather_output=True:  AllGather 最后一维 → [B, S, 4H]
+若 gather_output=False: 保持分片 [B, S, 4H/p]，直接交给下一层 RowParallel
 ```
 
-### 2.2 Row Parallel：A 沿行切分（兼 X 沿列切分）
+（PyTorch 存储：每卡 `weight` 为 `[4H/p, H]`，即 `[out_per_rank, in]`。）
+
+### 2.2 Row Parallel：A 沿行切分（兼 X 沿最后一维切分）（FFN 第二层）
 
 ```
-输入 X (已分片): [B, S, H]   权重 A_i: [H, 4H/p]
+接上一步 gather_output=False 的输出：
+  输入 X_i (已分片): [B, S, 4H/p]
+  数学权重 A:        [4H, H]，沿行切开
+  每卡 A_i:          [4H/p, H]
 
-GPU_i 算: Y_i = X_i @ A_i,   shape: [B, S, 4H]
+GPU_i 算: Y_i = X_i @ A_i,   shape: [B, S, H]     ← 每卡都是完整 out 维，但是「部分和」
                                       ↓
-                               AllReduce（或 ReduceScatter）
+                               AllReduce（求和；SP 下为 ReduceScatter）
                                       ↓
-                               Y = Σ Y_i,  shape: [B, S, 4H]
+                               Y = Σ_i Y_i,       shape: [B, S, H]
 ```
 
-关键：Row Parallel 的输入 `X` 必须已经是分片的（即 Column Parallel 的输出），这就是为什么 Column + Row 串联后只需要 **一次** 通信而不是两次。
+（PyTorch 存储：每卡 `weight` 为 `[H, 4H/p]`，即 `[out, in_per_rank]`，与 `RowParallelLinear` 一致。）
+
+对照关系：
+
+| | Column（§2.1） | Row（§2.2） |
+|--|----------------|-------------|
+| 切 A 的轴 | 输出维（列） | 输入维（行） |
+| 输入 X | 通常完整 `[..., H]` | 必须已按最后一维切开 `[..., 4H/p]` |
+| 局部结果 | 输出维的一块 | 完整输出维上的部分和 |
+| 聚合方式 | 拼接 / AllGather | **求和** / AllReduce |
+
+关键：Row Parallel 的输入 `X` 必须已经是分片的（即上一层 Column Parallel `gather_output=False` 的输出），这就是为什么 Column + Row 串联后只需要 **一次** 通信而不是两次。
 
 ---
 
