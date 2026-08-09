@@ -696,16 +696,38 @@ UCC 的两个优势：
 1. **更高带宽利用率**：UCC 在 InfiniBand 上比 NCCL 有更好的带宽利用率，尤其在消息较大时。
 2. **零 SM 占用**：UCC 通过 CPU 发起通信，不占用 GPU SM 资源，避免 P2P 通信与 TP GEMM 争抢 SM。
 
-使用方法：
+#### 和 TP 常用的 `CUDA_DEVICE_MAX_CONNECTIONS=1` 冲突吗？
+
+**冲突，而且是真冲突——全局只有一个环境变量，不能又是 1 又是 8。**
+
+| 场景 | 通常要求 | 原因 |
+|------|----------|------|
+| 默认 TP>1 / CP>1（Hopper/Ampere 等 **pre-Blackwell**，非 FSDP） | **必须 `=1`** | `arguments.py` 直接 assert；TP 异步 dgrad AllReduce 与 wgrad 重叠靠「单 connection」保证提交顺序 |
+| PP 选用 **UCC** 后端 | **必须 `!=1`**（文中举例 8） | UCC 需要多 connection；源码对 `=1` 直接 assert |
+| Blackwell 及以后 | 不再强制 `=1` | 架构上不再依赖这套连接数技巧 |
+| FSDP / 部分 MoE overlap | 倾向 `>1` 或 unset | 与 TP 的 `=1` 也互相挤兑，官方会 warn |
+
+因此：
+
+```text
+日常 TP+PP（NCCL P2P，pre-Blackwell）→ 设 CUDA_DEVICE_MAX_CONNECTIONS=1
+想开 PP 的 UCC 后端          → 不能同时满足上面的 =1；
+                               要么不用 UCC，要么接受与默认 TP 断言/最优重叠不兼容
+                               （Blackwell 上约束已放松，另当别论）
+```
+
+使用方法（**仅在你已决定走 UCC、且硬件/并行组合允许 `!=1` 时**）：
 
 ```python
+# 必须在进程最早阶段设置，且不要再写成 1
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
 initialize_model_parallel(
     ...,
     pipeline_model_parallel_comm_backend="ucc",
 )
-# 同时需要设置 CUDA_DEVICE_MAX_CONNECTIONS > 1（例如 8）
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
 ```
+
+初学 / 默认路径：PP 继续用 NCCL，`CUDA_DEVICE_MAX_CONNECTIONS=1`，**忽略**上面的 `=8` 示例即可。
 
 ---
 
