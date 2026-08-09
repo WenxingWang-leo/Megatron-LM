@@ -158,14 +158,11 @@ for i in range(num_warmup_microbatches):
 bubble_fraction ≈ (PP - 1) / (m + PP - 1)
 ```
 
-其中 m = `num_microbatches`。正确公式（**不要除以 PP**）：
+其中 m = `num_microbatches`。
 
 ```text
 m = global_batch_size / (micro_batch_size × data_parallel_size)
 ```
-
-原因：一个 optimizer step 里的 m 个 microbatch 会**依次流过每一个 PP stage**（流水线），并不是把全局 batch 再按 PP 切一份给各 stage。  
-各 stage 在一步里都要处理这同一批 m 个 microbatch；PP 只决定模型层怎么切，不改变 microbatch 个数。
 
 当 `m >> PP` 时气泡趋近于 0，这就是为什么增大 `num_microbatches` 能提升 PP 效率。
 
@@ -183,19 +180,57 @@ m = global_batch_size / (micro_batch_size × data_parallel_size)
 
 ### 4.3 完整时间线：PP=4，m=8
 
-下表用 F/B 加 microbatch 编号表示操作，`_` 表示气泡：
+先分清两件事，旧图常把它们糊在一起：
 
-```
-时间步：  0    1    2    3    4    5    6    7    8    9   10   11   12   13
-stage 0: F0   F1   F2  [F3B0 F4B1 F5B2 F6B3 F7B4] B5   B6   B7   _    _
-stage 1: _    F0   F1   F2  [F3B0 F4B1 F5B2 F6B3 F7B4] B5   B6   B7   _
-stage 2: _    _    F0   F1   F2  [F3B0 F4B1 F5B2 F6B3 F7B4] B5   B6   B7
-stage 3: _    _    _    F0   F1   F2   F3   F4   B4   B5   B6   B7   _    _
-         ↑____________________↑                             ↑_________↑
-              warmup (气泡)                                  cooldown (气泡)
+1. **各 stage 本地指令序**（代码 for 循环要跑的 F/B 列表）  
+2. **墙钟时间线**（还要满足 P2P：`F` 等上一 stage 的激活，`B` 等下一 stage 的梯度）
+
+#### 本地指令序（warmup = PP-r-1）
+
+```text
+s0 warm=3: F0 F1 F2 | F3 B0 F4 B1 F5 B2 F6 B3 F7 B4 | B5 B6 B7
+s1 warm=2: F0 F1    | F2 B0 F3 B1 F4 B2 F5 B3 F6 B4 F7 B5 | B6 B7
+s2 warm=1: F0       | F1 B0 F2 B1 F3 B2 F4 B3 F5 B4 F6 B5 F7 B6 | B7
+s3 warm=0:            F0 B0 F1 B1 F2 B2 F3 B3 F4 B4 F5 B5 F6 B6 F7 B7
 ```
 
-气泡总步数 = warmup + cooldown 中每个 stage 的空闲步数。对 stage 0：3 步 warmup + 0 步 cooldown（warmup 恰好等于 m 的余量，不超出）。
+注意：**最后一 stage 是 `F0 B0 F1 B1 …`，绝不是先把所有 F 做完再 B。**
+
+#### 墙钟时间线（`·` = 等 P2P 的气泡；每格 1 次 F 或 B）
+
+```text
+t:   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21
+s0: F0 F1 F2 F3  ·  ·  · B0 F4 B1 F5 B2 F6 B3 F7 B4  · B5  · B6  · B7
+s1:  · F0 F1 F2  ·  · B0 F3 B1 F4 B2 F5 B3 F6 B4 F7 B5  · B6  · B7
+s2:  ·  · F0 F1  · B0 F2 B1 F3 B2 F4 B3 F5 B4 F6 B5 F7 B6  · B7
+s3:  ·  ·  · F0 B0 F1 B1 F2 B2 F3 B3 F4 B4 F5 B5 F6 B6 F7 B7
+```
+
+为什么 **s3 还在 F0 时，s0 不可能已经 B0**？
+
+```text
+B0 的依赖链（必须从尾到头）：
+  s3: F0 → B0
+  s2: 等 s3 的 B0 → 自己的 B0
+  s1: 等 s2 的 B0
+  s0: 等 s1 的 B0
+
+上图里：s3 的 F0 在 t=3，B0 在 t=4；传到 s0 的 B0 要到 t=7。
+s0 在 t=3 做完 F3 后，t=4..6 只能空等（三个 ·），这才是 warmup 灌满流水线后、第一条反向浪涌到最前 stage 的代价。
+```
+
+#### 旧图错在哪
+
+```text
+# 错画（不要再用）
+stage 0: ... [F3B0 ...]   ← 把 F 和 B 塞进同一时间格，还暗示过早出现 B0
+stage 3: ... F0 F1 F2 F3 F4 B4 ...  ← 最后 stage 画成了 GPipe 式「先全 F 再 B」
+```
+
+- `F3B0` 写成一格：时间上 F3 与 B0 不能同时占 s0，且 B0 远晚于 s3 的 F0。  
+- s3 的 `F0…F4 B4`：与 `warmup=0` 的 `F0 B0 F1 B1…` 不符。
+
+气泡主要出现在：**前排 stage 等第一条反向**（上图 s0 的 t=4..6），以及收尾时前排等后排把剩余 `B` 传回来。
 
 ---
 
