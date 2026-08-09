@@ -158,7 +158,14 @@ for i in range(num_warmup_microbatches):
 bubble_fraction ≈ (PP - 1) / (m + PP - 1)
 ```
 
-其中 m = num_microbatches（每个 PP stage 处理的 microbatch 数量，= global_batch_size / micro_batch_size / DP / PP）。
+其中 m = `num_microbatches`。正确公式（**不要除以 PP**）：
+
+```text
+m = global_batch_size / (micro_batch_size × data_parallel_size)
+```
+
+原因：一个 optimizer step 里的 m 个 microbatch 会**依次流过每一个 PP stage**（流水线），并不是把全局 batch 再按 PP 切一份给各 stage。  
+各 stage 在一步里都要处理这同一批 m 个 microbatch；PP 只决定模型层怎么切，不改变 microbatch 个数。
 
 当 `m >> PP` 时气泡趋近于 0，这就是为什么增大 `num_microbatches` 能提升 PP 效率。
 
