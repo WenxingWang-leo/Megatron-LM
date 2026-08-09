@@ -71,21 +71,53 @@ GPU_i 算: Y_i = X_i @ A_i,   shape: [B, S, H]     ← 每卡都是完整 out �
 
 ---
 
-## 3. mappings.py：六种通信原语
+## 3. mappings.py：通信原语怎么数？
 
 ```
 文件: megatron/core/tensor_parallel/mappings.py
 ```
 
-| 函数名 | 前向传播 | 反向传播 | 用途 |
-|--------|---------|---------|------|
-| `copy_to_tensor_model_parallel_region` (CopyTo) | 恒等（广播） | AllReduce | Column Parallel 非 SP 情况下的输入 |
-| `reduce_from_tensor_model_parallel_region` (ReduceFrom) | AllReduce | 恒等 | Row Parallel 非 SP 情况下的输出 |
-| `scatter_to_tensor_model_parallel_region` | 沿最后维切片 | 沿最后维 AllGather | Vocabulary 并行输出 |
-| `gather_from_tensor_model_parallel_region` | 沿最后维 AllGather | 沿最后维切片 | Vocab 并行输入 |
-| `scatter_to_sequence_parallel_region` (SP) | 沿第一维切片（seq） | 沿第一维 AllGather | SP 下 Row→layernorm 衔接 |
-| `reduce_scatter_to_sequence_parallel_region` (SP) | ReduceScatter（第一维） | AllGather | Row Parallel SP 模式下输出 |
-| `gather_from_sequence_parallel_region` (SP) | AllGather（第一维） | ReduceScatter | Column Parallel SP 模式下输入 |
+旧版标题写「六种」容易对不上号：表里常列出 7 行，源码里 `autograd.Function` 还更多。  
+更干净的数法是：**经典 TP 四件套（2 对对偶）+ Sequence Parallel 三件套**。
+
+### 3.0 先认两对对偶（经典 4 种）
+
+非 SP 时，Megatron 论文/早期代码的核心就是这 **4** 个封装——两两互为前反向对偶：
+
+| # | 函数名 | 前向 | 反向 | 典型用途 |
+|---|--------|------|------|----------|
+| 1 | `copy_to_tensor_model_parallel_region` | 恒等 | AllReduce | Column 入口（非 SP）：把输入标成 TP region |
+| 2 | `reduce_from_tensor_model_parallel_region` | AllReduce | 恒等 | Row 出口（非 SP）：把各卡部分和加总 |
+| 3 | `scatter_to_tensor_model_parallel_region` | 最后一维切分 | 最后一维 AllGather | 把完整向量拆进各 TP rank |
+| 4 | `gather_from_tensor_model_parallel_region` | 最后一维 AllGather | 最后一维切分 | 把各 TP 分片拼回完整向量 |
+
+记忆口诀：
+
+```text
+CopyTo  ↔  ReduceFrom     （「进 region / 出 region」）
+Scatter ↔  Gather         （「切开 / 拼回」，默认沿最后一维）
+```
+
+### 3.1 再加上 SP 三件套（切的是序列维）
+
+开 Sequence Parallel 后，通信改走**第一维（seq）**，又多 **3** 个常用封装：
+
+| # | 函数名 | 前向 | 反向 | 典型用途 |
+|---|--------|------|------|----------|
+| 5 | `scatter_to_sequence_parallel_region` | 第一维切分 | 第一维 AllGather | 进入序列分片布局 |
+| 6 | `gather_from_sequence_parallel_region` | 第一维 AllGather | ReduceScatter | Column（SP）算 GEMM 前聚齐序列 |
+| 7 | `reduce_scatter_to_sequence_parallel_region` | ReduceScatter | AllGather | Row（SP）出口：求和并回到 S/TP |
+
+因此：**读 Column/Row 主路径，心里记「4 + 3 = 7 个常用 wrapper」**；说「六种」是历史含混说法，本文不再用。
+
+### 3.2 源码里还有、主路径较少提的
+
+同文件还有例如：
+
+- `all_gather_last_dim_from_tensor_parallel_region` / `reduce_scatter_last_dim_to_tensor_parallel_region`
+- `all_to_all`，以及 `all_to_all_sp2hp` / `all_to_all_hp2sp`（SP 与 hidden-parallel 布局互换）
+
+MoE dispatcher、部分融合路径会用到它们；先把上面 4+3 吃透即可。
 
 "前向恒等 + 反向 AllReduce"就是 CopyTo 的设计：前向传播时每个 GPU 都有完整输入，不需要通信；反向传播时输入梯度需要从所有 TP rank 汇总。
 
@@ -931,7 +963,7 @@ return make_sharded_tensors_for_checkpoint(
 
 张量并行的实现由三层组成：
 
-1. **`mappings.py`**：六个 `torch.autograd.Function` 子类，封装了前向/反向完全对称的通信原语（CopyTo、ReduceFrom、Scatter、Gather 及其 SP 变体）。AllToAll 辅助函数（`all_to_all_sp2hp`/`hp2sp`）用于 SP 和 HP 格式互换。
+1. **`mappings.py`**：经典 **4** 个 TP 原语（CopyTo↔ReduceFrom、Scatter↔Gather）+ SP **3** 件套；另有 AllToAll / last-dim RS-AG 等扩展。AllToAll 辅助函数（`all_to_all_sp2hp`/`hp2sp`）用于 SP 和 HP 格式互换。
 2. **`ColumnParallelLinear` / `RowParallelLinear`**（`layers.py`）：把权重矩阵按输出维/输入维切分，通过 `gather_output` 和 `input_is_parallel` 控制与相邻层的衔接；SP 模式下把序列维也一并切分，进一步节省激活内存。梯度路径：Column dgrad 做 AllReduce（异步与 wgrad GEMM 并行），Row wgrad 无需额外通信。
 3. **VocabParallelEmbedding + vocab_parallel_cross_entropy**：词表维度的并行，避免在大词表上做全量 AllGather。SwiGLU FFN 中 FC1 输出大小翻倍（含 gate），FC2 输入大小减半（激活后）。
 
