@@ -350,6 +350,8 @@ reset_model_temporary_tensors(config, model)
 
 ### 步骤 8：梯度归一化（per-token loss）
 
+当 loss 按 token 平均（或按非 padding token 计数）时，反向得到的梯度还要统一除以全局 `num_tokens`，否则不同 DP/PP 布局下有效学习率会漂。
+
 ```python
 # megatron/core/distributed/finalize_model_grads.py  第 595-614 行
 if num_tokens is not None:
@@ -360,14 +362,14 @@ if num_tokens is not None:
     # 2. 跨 DP 组 AllReduce（sum 出全局 token 数）
     torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
 
-    # 3. 梯度 ÷ num_tokens
+    # 3. 梯度 ÷ num_tokens（等价于每个参数 grad *= 1/num_tokens）
     safe_num_tokens = torch.clamp(num_tokens, min=1)
     scaling = 1.0 / safe_num_tokens
     for model_chunk in model:
         model_chunk.scale_gradients(scaling)
 ```
 
-`num_tokens` 是全局 batch 中所有非 padding token 的数量，需要在 loss 函数中统计并通过 `forward_backward_func` 的返回值传出。
+`num_tokens` 是全局 batch 中所有非 padding token 的数量，需在 loss 函数中统计，经 `forward_backward_func` 返回值传入 `finalize_model_grads`。
 
 ---
 
@@ -410,18 +412,8 @@ for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
 
 ## 11. 梯度归一化（per-token）
 
-```python
-# finalize_model_grads.py  第 596-614 行
-if num_tokens is not None:
-    # normalize gradients for per-token loss normalization.
-    # if we are using by the number of tokens, then we use that as a divisor.
-    # this number will be the total number of non-padded tokens in the global batch.
-    scaling_factor = 1.0 / num_tokens
-    for model_chunk in model:
-        model_chunk.scale_gradients(scaling)
-```
-
-这一步把每个梯度都乘以 `1/num_tokens`，实现 per-token 的 loss 归一化。`num_tokens` 是全局 batch 中所有非 padding token 的数量，需要在 loss 函数中统计并通过 `forward_backward_func` 的返回值传出。
+> **本节与上文重复，正文已合并进 §8「步骤 8」**（含 `num_tokens` 的 PP broadcast、DP×CP AllReduce、`clamp` 与 `scale_gradients`）。  
+> 若只关心 per-token 归一化，直接回看该步骤即可，此处不再重贴代码。
 
 ---
 
