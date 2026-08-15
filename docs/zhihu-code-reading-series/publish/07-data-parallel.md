@@ -713,7 +713,7 @@ Distributed Optimizer（DP=8）：
 
 **题目 3**：阅读 `param_and_grad_buffer.py` 中 `_ParamAndGradBucket` 类，解释 `gradient_scaling_factor` 字段的作用，以及它在 MoE 和非 MoE 模型中的值分别是多少（当 `average_in_collective=False` 时）。
 
-**题目 4**：设 global_batch_size=512，micro_batch_size=4，PP=4，DP=2，那么 `num_microbatches=512/(4×2)/4=16`。在 `finalize_model_grads` 最后一步梯度归一化中，`num_tokens` 应该是多少（假设序列长度 S=2048，无 padding）？这个值是在哪里计算并传入的？
+**题目 4**：设 `global_batch_size=512`，`micro_batch_size=4`，`PP=4`，`DP=2`，则 `num_microbatches = 512/(4×2) = 64`（**不要除以 PP**）。在 `finalize_model_grads` 最后一步梯度归一化中，`num_tokens` 应该是多少（假设序列长度 `S=2048`，无 padding）？这个值是在哪里计算并传入的？
 
 **题目 5**：在 7B 参数 BF16 模型 + DistOpt + DP=16 的配置下，每个 rank 的优化器相关内存（FP32 主参数 + FP32 梯度 + Adam m + Adam v）是多少 GB？与第 6 节 DP=8 的结果相比，内存节省了多少？
 
