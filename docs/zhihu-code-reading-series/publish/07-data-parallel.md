@@ -410,13 +410,6 @@ for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
 
 ---
 
-## 11. 梯度归一化（per-token）
-
-> **本节与上文重复，正文已合并进 §8「步骤 8」**（含 `num_tokens` 的 PP broadcast、DP×CP AllReduce、`clamp` 与 `scale_gradients`）。  
-> 若只关心 per-token 归一化，直接回看该步骤即可，此处不再重贴代码。
-
----
-
 ## 12. no_sync 上下文管理器的作用
 
 在流水线并行中，有 `num_microbatches` 个 microbatch 需要依次执行。在最后一个 microbatch 之前，梯度不应该立即 AllReduce（因为还有梯度没算完）。Megatron 用 `no_sync` 上下文来实现这一点：
