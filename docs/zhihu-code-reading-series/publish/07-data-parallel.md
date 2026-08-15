@@ -765,21 +765,48 @@ class DistributedDataParallelConfig:
 
 ## 22. 附录：梯度同步的通信量估算
 
-以 LLaMA-7B（P=7B 参数，BF16 梯度）为例：
+以 LLaMA-7B（P = 7×10⁹ 参数，BF16 梯度）为例。先固定数据量：
 
-| 场景 | 操作 | 通信量（每 rank）|
-|------|------|------|
-| 标准 AllReduce（DP=8） | AllReduce | P × 2 bytes × 2(send+recv) / DP = 7B×2×2/8 = 3.5 GB |
-| DistOpt ReduceScatter（DP=8） | ReduceScatter | P × 2 bytes × (DP-1)/DP = 7B×2×7/8 = 12.25 GB |
-| DistOpt AllGather（DP=8） | AllGather | P × 2 bytes × (DP-1)/DP = 12.25 GB |
-| DistOpt 合计 | RS + AG | ~24.5 GB |
+```text
+S = P × 2 bytes = 7e9 × 2 = 14 GB     # 每张卡上「完整梯度」的字节数
+DP = 8
+chunk = S / DP = 1.75 GB               # ring 上每一小块
+```
 
-看起来 DistOpt 通信量更大（AllReduce 3.5 GB vs DistOpt 24.5 GB），但这是因为标准计算方式不同：
+### Ring 算法下，每 rank 实际收发多少？
 
-- AllReduce 实际 = 2 × P × 2 / DP（ring 通信，每个 rank 发送 + 接收 P/DP 大小的块，共 2(DP-1)/DP 轮）
-- DistOpt RS = AllReduce 的一半（只做 reduce 不 gather），AG = AllReduce 的另一半
+无论是一次 AllReduce，还是 DistOpt 的 ReduceScatter + AllGather，NCCL 常用的都是 **ring**，每 rank 通信量是：
 
-两者等效，DistOpt 没有额外通信量，只是把通信分成了两个阶段，便于在两者之间插入优化器更新步骤。
+```text
+ReduceScatter：发 (DP-1) 个 chunk = (DP-1)/DP × S
+AllGather：    发 (DP-1) 个 chunk = (DP-1)/DP × S
+完整 AllReduce = RS + AG            = 2 × (DP-1)/DP × S
+```
+
+代入数字：
+
+| 场景 | 公式 | 每 rank 通信量 |
+|------|------|----------------|
+| 标准 AllReduce（DP=8） | `2 × (DP-1)/DP × S` | `2 × 7/8 × 14 = **24.5 GB**` |
+| DistOpt ReduceScatter | `(DP-1)/DP × S` | `7/8 × 14 = **12.25 GB**` |
+| DistOpt AllGather（参数） | `(DP-1)/DP × S` | `7/8 × 14 = **12.25 GB**` |
+| DistOpt 合计（RS+AG） | 同上两行之和 | **24.5 GB** |
+
+所以：**AllReduce 与 DistOpt 合计一样大（都是 24.5 GB），不是 3.5 vs 24.5。**
+
+### 旧表里「3.5 GB」错在哪？
+
+错误写法 `P × 2 × 2 / DP = 3.5 GB` 少乘了 `(DP-1)`，只相当于「两个 chunk」的量级，**不是** ring AllReduce 的真实字节数。
+
+对照关系一句话：
+
+```text
+AllReduce          = 24.5 GB
+DistOpt RS + AG    = 12.25 + 12.25 = 24.5 GB
+→ 通信量等价；DistOpt 只是拆成两段，中间可以夹 optimizer.step（只更新本地 1/DP 参数）
+```
+
+DistOpt 的收益在**显存**（优化器状态按 DP 切分），不在「少传梯度字节」。
 
 ---
 
