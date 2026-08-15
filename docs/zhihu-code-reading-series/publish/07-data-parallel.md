@@ -785,21 +785,13 @@ AllGather：    发 (DP-1) 个 chunk = (DP-1)/DP × S
 | DistOpt AllGather（参数） | `(DP-1)/DP × S` | `7/8 × 14 = **12.25 GB**` |
 | DistOpt 合计（RS+AG） | 同上两行之和 | **24.5 GB** |
 
-所以：**AllReduce 与 DistOpt 合计一样大（都是 24.5 GB），不是 3.5 vs 24.5。**
-
-### 旧表里「3.5 GB」错在哪？
-
-错误写法 `P × 2 × 2 / DP = 3.5 GB` 少乘了 `(DP-1)`，只相当于「两个 chunk」的量级，**不是** ring AllReduce 的真实字节数。
-
-对照关系一句话：
-
 ```text
-AllReduce          = 24.5 GB
-DistOpt RS + AG    = 12.25 + 12.25 = 24.5 GB
-→ 通信量等价；DistOpt 只是拆成两段，中间可以夹 optimizer.step（只更新本地 1/DP 参数）
+AllReduce       = 24.5 GB
+DistOpt RS + AG = 12.25 + 12.25 = 24.5 GB
 ```
 
-DistOpt 的收益在**显存**（优化器状态按 DP 切分），不在「少传梯度字节」。
+两者通信量等价；DistOpt 只是拆成两段，中间可以夹 `optimizer.step`（只更新本地 1/DP 参数）。  
+DistOpt 的收益在**显存**（优化器状态按 DP 切分），不在少传梯度字节。
 
 ---
 
