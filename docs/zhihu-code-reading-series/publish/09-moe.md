@@ -370,31 +370,34 @@ output = self.postprocess(output, shared_expert_output)             # 最后加�
 
 ### 7.1 AllGather vs AllToAll 带宽对比
 
-| 指标 | AllGather | AllToAll |
-|------|-----------|---------|
-| 通信量（每 token） | `H × (TP·EP - 1)` | ≈ `H × (topk/EP × (EP-1)/EP)` |
-| 通信量特点 | 与 EP 规模线性增长 | 近似与 EP 无关（稀疏路由时） |
-| 形状是否固定 | ✅ 固定（AllGather 大小 = 全量） | ⚠️ 动态（每 rank 发送量不同） |
-| CUDA Graph 兼容 | ✅ 容易 | ⚠️ 需要 capacity_factor 固定 shape |
-| 实现复杂度 | 低 | 高（需要 input/output splits） |
-| 推荐 EP | EP ≤ 4 | EP ≥ 4 |
+统一用「每 rank、单向、元素个数」比较；hidden 维为 `H`，总 token 数 `T`（均分到 `EP` 张卡，每卡 `T/EP`），每个 token 选 `topk` 个专家。
 
-**通信量公式推导**（T tokens，hidden_size=H，topk=2，EP=4）：
+| 指标 | AllGather | AllToAll（dispatch） |
+|------|-----------|----------------------|
+| 每 rank 通信量 | `T × (EP-1)/EP × H` | `(T/EP) × topk × (EP-1)/EP × H` |
+| 相对比例 | 1 | `topk / EP` |
+| 形状是否固定 | ✅ 固定 | ⚠️ 动态（每 rank 发送量随路由变） |
+| CUDA Graph 兼容 | ✅ 更容易 | ⚠️ 常需 capacity / pad 固定 shape |
+| 实现复杂度 | 低 | 高（需要 `input/output_splits`） |
+| 推荐 EP | 较小 EP | 较大 EP、稀疏路由 |
 
+**数值推导**（`T` tokens，`hidden=H`，`topk=2`，`EP=4`，专家均匀分布）：
+
+```text
+AllGather（每 rank 接收）：
+  本地已有 T/4 个 token，还需从其他卡收 3T/4 个
+  元素数 = 3T/4 × H
+
+AllToAll dispatch（每 rank 发送）：
+  本地 T/4 个 token，每个复制 topk=2 份 → 共 T/2 个 token-expert 副本
+  其中发往其他 3 个 EP rank 的比例约 (EP-1)/EP = 3/4
+  元素数 = (T/4) × 2 × (3/4) × H = 3T/8 × H
+
+比值：AllToAll / AllGather = (3T/8 × H) / (3T/4 × H) = topk/EP = 2/4 = 1/2
+若 EP=16、topk=2：比值 = 2/16 = 1/8
 ```
-AllGather 通信量（每 rank 接收）：
-  每 rank 有 T/4 个 tokens
-  AllGather 到 T 个 tokens：需要传输 3T/4 × H 个元素
-  → 4 个 rank 合计 = 3TH（BF16 = 6TH bytes）
 
-AllToAll 通信量（每 rank 发送）：
-  T/4 tokens，每 token 路由 topk=2 个专家
-  平均 topk/num_experts = 2/16 = 12.5% 的 token 去每个专家
-  每 rank 发送给其他 3 个 rank 约 T/4 × 2 × 3/4 = 3T/8 个 token-expert 对
-  → 远小于 AllGather
-
-AllToAll 在 EP=16,topk=2 时通信量约为 AllGather 的 1/8
-```
+Combine 阶段还有一次反向 AllToAll（量级同 dispatch）；AllGather 路径对应还有 ReduceScatter。上表先比「聚齐 token」这一侧，便于看清稀疏路由如何压通信量。
 
 ### 7.2 AllToAll Dispatcher step-by-step：T tokens，topk=2，EP=4 的完整推演
 
@@ -449,18 +452,16 @@ rank0 的 E3 处理其他 rank 发来的 tokens
 
 专家计算完成后，结果逆向通过 AllToAll 发回 token 所在的原始 rank，按 `probs` 加权求和（weighted combine）。
 
-**数值总结（T=16, topk=2, EP=4）**：
+**数值总结（T=16, topk=2, EP=4，按每 rank 元素数）**：
 
+```text
+AllGather（单向）：     3T/4 × H = 12H
+AllToAll dispatch：     3T/8 × H = 6H
+AllToAll combine：      约再 6H
+AllToAll 来回合计：     约 12H
 ```
-每次前向通信量 = T × topk × H / EP × (EP-1)/EP × 2（来去各一次）
-              = 16 × 2 × H / 4 × 3/4 × 2
-              = 12H 个元素
 
-同等 AllGather：
-  AllGather 量 = T × H × (EP-1) = 16 × H × 3 = 48H 个元素
-
-AllToAll 约为 AllGather 的 25%（本例子，topk 占比较高时差距更大）
-```
+同一套假设下，dispatch 单侧约为 AllGather 的 `topk/EP = 1/2`；来回两次后与「一次 AllGather」同量级。EP 更大、topk 仍小时（如 EP=16、topk=2），单侧比值降到 `1/8`，AllToAll 才明显更省。
 
 ### 7.3 AllGather Dispatcher
 
