@@ -328,35 +328,36 @@ Row Parallel 的前向是 AllReduce（ReduceScatter in SP），反向是其对�
 
 ---
 
-## 7. SP 模式的 AllToAll 辅助函数
+## 7. Sequence Parallel：切的是序列上的激活，不是 LN 权重
 
-除了 ReduceScatter/AllGather，Megatron 还在 `mappings.py` 里提供了两个 AllToAll 辅助函数，用于从 SP 格式（序列并行，按序列维度分片）和 HP 格式（head/hidden 并行，按隐藏维切分）之间互换：
+Sequence Parallel（SP）**挂在 TP 组上**：还是那 `TP` 张卡，额外把**序列维**切开，用来省 LayerNorm / Dropout 等「未切权重」算子的激活显存。
 
-```python
-# megatron/core/tensor_parallel/mappings.py  第 566-621 行
-def all_to_all_sp2hp(input_, group=None):
-    """[num_tokens/TP, H] → [num_tokens, H/TP]（SP→HP）
-    
-    用于从序列并行（SP）切换到头并行（HP）的场景，
-    例如在某些 attention 变体中需要对不同 token 做不同操作时。
-    """
-    group = get_tensor_model_parallel_group_if_none(group)
-    world_size = group.size()
-    input_ = input_.reshape(-1, input_.shape[-1])
-    # 把 H 维切成 TP 份，然后拼成 [num_tokens*TP, H/TP]
-    split_tensors = torch.split(input_, split_size_or_sections=input_.shape[-1] // world_size, dim=1)
-    concat_tensor = torch.cat(split_tensors, dim=0)
-    output = all_to_all(group, concat_tensor)   # AllToAll: 重分配 token
-    return output
+```text
+TP = 4，序列长度 S：
 
-def all_to_all_hp2sp(input_, group=None):
-    """[num_tokens, H/TP] → [num_tokens/TP, H]（HP→SP）
-    逆操作
-    """
-    ...
+rank0: tokens [0, S/4)
+rank1: tokens [S/4, S/2)
+rank2: tokens [S/2, 3S/4)
+rank3: tokens [3S/4, S)
+
+四份是并行算的，不是轮流送进同一张卡。
 ```
 
-这两个函数的应用场景：当模型某些算子（如 cross-attention 中的 key-value 重分配）需要改变并行维度时，可以用 AllToAll 代替 AllGather+ReduceScatter 的两步操作，通信量相同但只需要一次内核调用。
+| 对象 | SP 下怎么处理 |
+|------|----------------|
+| Column / Row 的 **权重** | 仍按 TP 切（输出维或输入维），与不开 SP 相同 |
+| LayerNorm / RMSNorm 的 **γ、β** | **不切**，每张 TP 卡一份完整副本 |
+| LN 看到的 **激活** | 只含本卡的 `S/TP` 段 |
+| Column GEMM 前 | `gather_from_sequence_parallel_region`：沿序列维 AllGather，凑齐 `S` 再乘本卡权重分片 |
+| Row GEMM 后 | `reduce_scatter_to_sequence_parallel_region`：先对部分和 ReduceScatter 回 `S/TP` |
+
+LN 权重的梯度：每卡只看到部分 token，必须在 TP 组上 **AllReduce**（`finalize_model_grads` 的 non-tensor-parallel / SP LayerNorm 那一步），否则各卡 γ、β 会漂开。
+
+约束：`S` 必须能被 `TP` 整除；且 `RowParallelLinear` 要 `input_is_parallel=True`（源码直接 assert）。官方在 **TP 与 EP 同用**时通常要求开 SP。
+
+### 7.1 SP 与 HP 互换的 AllToAll
+
+除了 ReduceScatter/AllGather，`mappings.py` 还有 `all_to_all_sp2hp` / `all_to_all_hp2sp`：把 `[tokens/TP, H]` 与 `[tokens, H/TP]` 互换。通信量与「AllGather + 切分」同量级，但一次 kernel。主路径 FFN 的 SP 用的是上面的 gather / reduce-scatter，不必先读这两个函数。
 
 ---
 

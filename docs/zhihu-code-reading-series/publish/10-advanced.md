@@ -830,7 +830,10 @@ A：对大多数任务影响可忽略（< 0.1% perplexity 差异），但有些�
 A：不是。DP 增大意味着每步处理的 global batch 增大（`global_batch_size = micro_batch × GAS × DP`），需要相应增大 learning rate（通常遵循线性缩放规则），否则训练不稳定。此外，DP AllReduce 通信量随 DP 增大，大 DP 时 ReduceScatter/AllGather 成为瓶颈。实践中 DP=128~1024 时需要精细的学习率调度。
 
 **Q6：TP+PP+DP+EP+CP 五维并行同时使用时，进程组如何组织？**  
-A：进程总数 = TP × PP × DP × EP × CP（EP 和 CP 嵌套在 DP 组内）。实际上 EP 不增加进程数，而是将 DP 中的 GPU 重新分配为 EP 角色，`dp_size = total / (TP × PP × EP)`，CP 进一步在 dp 组内切分。`parallel_state` 的 `initialize_model_parallel` 函数负责所有进程组的正确初始化。
+A：同一套 `world_size` 上有**两套编组**，不是五维简单连乘再解释一次。  
+- dense：`world = TP × PP × CP × dense_DP`  
+- expert：`world = expert_TP × EP × PP × expert_DP`（expert 侧 `cp` 强制为 1）  
+两套的 PP ranks 必须相同。EP 不「新变出 GPU」，而是从专家副本维里抽出卡来切不同专家。进 MoE 时序列仍按 CP 分片，不做全序列 AllGather。详见第 4、11 篇。
 
 **Q7：如何估计某个配置下的显存使用？**  
 A：粗略公式：`显存 ≈ (模型参数 × 精度字节 × 2 + 激活 × GAS × micro_batch) / TP / PP`。精确计算需考虑：(1) BF16 模型参数 + FP32 master；(2) Adam 的 m+v 在 DistOpt 下按 DP 分片；(3) KV cache（推理）或激活 cache（训练+recompute）；(4) 通信 buffer（AllToAll/AllGather）。

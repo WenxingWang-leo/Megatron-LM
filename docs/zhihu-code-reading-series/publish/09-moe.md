@@ -560,6 +560,8 @@ if self.moe_layer_recompute and self.training:
 
 ## 九、Expert Parallel 的并行维度
 
+拓扑与公式以第 11 篇为准。下面只补 MoE 层里会碰到的三个旋钮。
+
 ### 9.1 EP 与其他并行维度的关系
 
 ```

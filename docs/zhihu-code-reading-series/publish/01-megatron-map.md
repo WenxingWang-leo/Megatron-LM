@@ -1,6 +1,6 @@
 # 精读 Megatron 源码（1）：从零建立心智模型——地图、术语表与阅读路线
 
-> **系列导言**：这是一个面向完全初学者的 Megatron-LM 源码精读系列，共 10 篇。你不需要事先了解分布式训练，但需要会 Python 和基本的 PyTorch。每篇文章都会带你从"看不懂"到"能改代码"。
+> **系列导言**：这是一个面向完全初学者的 Megatron-LM 源码精读系列（主线 01–10，另有第 11 篇 EP 专题）。你不需要事先了解分布式训练，但需要会 Python 和基本的 PyTorch。每篇文章都会带你从"看不懂"到"能改代码"。
 
 ---
 
@@ -340,7 +340,7 @@ VPP 要求 `num_layers / (PP × VPP)` 必须是整数。32 层 / PP=4 / VPP=2 = 
 
 ---
 
-## 10. 全系列目录（共 10 篇）
+## 10. 全系列目录
 
 | 篇号 | 标题 | 核心内容 |
 |------|------|----------|
@@ -348,12 +348,13 @@ VPP 要求 `num_layers / (PP × VPP)` 必须是整数。32 层 / PP=4 / VPP=2 = 
 | **2** | 完整拆解一次训练——从 `__main__` 到 `optimizer.step` | 训练循环全流程 |
 | **3** | GPTModel 全拆解——Config、Spec 与每一层计算 | 模型架构深度分析 |
 | **4** | parallel_state：所有并行的地基 | 进程组初始化 |
-| **5** | 张量并行：矩阵如何被切开 | ColumnParallel/RowParallel |
+| **5** | 张量并行：矩阵如何被切开 | ColumnParallel/RowParallel、SP |
 | **6** | 流水线并行：1F1B 与 VPP | 调度算法、P2P 通信 |
 | **7** | 数据并行：DDP 与分布式优化器 | 梯度同步、ZeRO |
 | **8** | 优化器与 Checkpoint | DistOpt、ShardedTensor |
-| **9** | MoE：专家如何路由和并行 | 路由、All-to-All、EP |
-| **10** | 前沿扩展：CP/FP8/Spec/MTP | 最新特性 |
+| **9** | MoE：Router、Dispatcher、负载均衡 | 路由、All-to-All |
+| **10** | 前沿扩展：CP/FP8/推理/贡献 | 进阶 |
+| **11** | 专家并行 EP（建议先于 09） | 切分、token 迁移、与 DP 关系 |
 
 ---
 

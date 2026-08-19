@@ -554,8 +554,14 @@ parallel_state.get_expert_tensor_parallel_group()  # expert_TP
 | EP + DP/expert_DP | 必须理解 | 见 §5：`dense_DP ≈ EP × expert_DP`（在 TP 对齐、CP=1 时） |
 | EP + TP / expert_TP | 常见 | 开 SP；细粒度 MoE 常 `expert_TP=1` |
 | EP + PP | 常见 | PP 组必须与 dense 一致；专家层落在某些 PP stage |
-| EP + CP | **受限制** | 同一 RankGenerator 内禁止同时 >1；expert 路径 cp 强制 1 |
+| EP + CP | **受限制** | 同一 RankGenerator 内禁止同时 >1；expert 路径 `cp` 强制为 1；**配置仍可同时 >1** |
 | EP + DistOpt | 常见 | 专家缓冲走 `expert_parallel_buffers` / `intra_expt_dp` |
+
+### 8.0 EP 与 CP 同时 >1 时数据长什么样？
+
+可以同时设 `--context-parallel-size >1` 和 `--expert-model-parallel-size >1`。dense 组用 CP、expert 组用 EP（`cp=1`）。
+
+进 MoE 层时，本卡仍只有约 `S/CP` 的序列分片，**不会**先 AllGather 成全长再 dispatch。EP 只对「路由到本地 experts 的那些 token」做 AlltoAll。CP 的全序列语义在 Attention 的 KV 通信里；MoE 的 `tp_cp_group` 多用于 aux/统计 reduce。
 
 ### 8.1 「EP 会不会增加 world size？」
 

@@ -492,9 +492,18 @@ expert_DP = world_size / (expert_TP × EP × PP)
         └─ expert_DP：持有相同 local experts 的卡之间同步梯度
 ```
 
-### 7.2 EP 约束：cp 必须为 1
+### 7.2 EP 与 CP：不是「配置不能同时 >1」
 
-RankGenerator 中有明确断言 `ep==1 or cp==1`。EP 组的 AlltoAll 通信需要在同一 PP stage 内的 EP rank 之间进行，而 CP 的 KV 交换也需要跨 rank 通信。两者同时启用会使通信拓扑图出现循环依赖，调度器无法安全地安排 kernel 执行顺序。因此代码强制：若 EP > 1，则 expert_decoder_rank_generator 中 cp=1。
+`RankGenerator` 里有断言 `ep==1 or cp==1`。这句话的对象是**一个** generator，不是整次训练：
+
+| Generator | 怎么设 | 含义 |
+|-----------|--------|------|
+| dense（Attention 等） | `ep=1`，`cp` 可以 >1 | 序列按 CP 切开；没有 EP 维 |
+| expert（Routed Experts） | `ep` 可以 >1，**`cp=1`** | 专家按 EP 切开；编组公式里没有 CP |
+
+因此 **CLI 上可以同时 `--context-parallel-size 2 --expert-model-parallel-size 8`**：两套 generator 各自满足断言。
+
+进 MoE 时，hidden 仍是本卡上的序列分片（约 `S/CP`），**不会**先在 CP 维 AllGather 成全长再做 EP。EP AlltoAll 搬的是「路由到某专家的 token」，不是拼完整序列。Router 的 aux/token 统计才会在 `tp_cp_group` 上做小规模 AllReduce。
 
 ### 7.3 EP vs 非 EP 组对比
 
@@ -1035,13 +1044,13 @@ print(f"rank {rank} passed barrier")  # 如果 hang，说明组构造有问题
 NCCL_DEBUG=WARN NCCL_DEBUG_SUBSYS=ALL python train.py 2>&1 | grep -i timeout
 ```
 
-**场景 D**：CP>1 且 EP>1 同时设置，触发 `RankGenerator` 断言：
+**场景 D**：`CP>1` 且 `EP>1` 时，**不要**把两者塞进同一个 `RankGenerator`。源码用两套 generator（dense `ep=1`、expert `cp=1`），配置可以同时大于 1。若自己手写 `RankGenerator(ep=2, cp=2, ...)` 才会触发：
 
 ```
 AssertionError: Both EP and CP > 1 in not allow in one rank generator. ...
 ```
 
-修复方法：若模型同时需要 CP 和 MoE，必须确保 `context_parallel_size=1`（禁用 CP）或 `expert_model_parallel_size=1`（禁用 EP），两者不能共存。
+修复：走 `initialize_model_parallel` 的默认路径，而不是关掉 CP 或 EP。
 
 ---
 

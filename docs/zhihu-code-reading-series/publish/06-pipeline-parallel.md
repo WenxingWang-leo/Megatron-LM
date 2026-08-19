@@ -663,15 +663,27 @@ recv_forward(...)   # 等待 stage 0 的 send
 
 ## 13. combined_1f1b 与 hybrid_cp_schedule
 
-Megatron 还提供了两个高级调度变体：
+标准 1F1B 是「同一 stage 上：先整段 F，再整段 B」（或稳态里 F、B 交替但各算各的 kernel）。下面两个变体解决的是**重叠**，不是改 PP 切层方式。
 
 ### 13.1 combined_1f1b（`combined_1f1b.py`）
 
-把流水线内的正向和反向合并成一个 kernel，减少 CPU-GPU 同步开销。当 PP=1 时使用 `combined_1f1b_schedule_for_no_pipelining`，当 PP>1 时使用 `combined_1f1b_schedule_for_interleaved_pipelining`。
+目标：让 **microbatch i 的某些层 backward** 与 **microbatch i+1 的对应层 forward** 在 GPU 上重叠，特别是把 MoE 的 EP AlltoAll 藏进另一条 microbatch 的 Attention/MLP 计算里。
+
+PP=1、4 个 microbatch 时，源码注释里的相位是：
+
+```text
+Phase 0:  mb0 只有 Forward
+Phase 1:  mb0 Backward  ∥  mb1 Forward
+Phase 2:  mb1 Backward  ∥  mb2 Forward
+Phase 3:  mb2 Backward  ∥  mb3 Forward
+Phase 4:  mb3 只有 Backward
+```
+
+入口：`combined_1f1b_schedule_for_no_pipelining`（PP=1）与 `combined_1f1b_schedule_for_interleaved_pipelining`（PP>1 + VPP）。依赖独立 CUDA stream（`set_streams` / `high_priority_a2a_comm_stream`）。未开这类 overlap 时走普通 `schedules.py` 即可，不必先读这个文件。
 
 ### 13.2 hybrid_cp_schedule（`hybrid_cp_schedule.py`）
 
-当同时启用 CP（Context Parallel）和 PP 时，CP 的 AllGather/ReduceScatter（用于 KV 交换）和 PP 的 P2P 通信可能竞争带宽。`hybrid_context_parallel_forward_backward` 把 CP 的 KV 通信与 PP 的 P2P 通信交替安排，减少带宽冲突。
+同时开 CP 与 PP 时，Attention 里 CP 的 KV 集体通信和 PP 的 P2P 会抢互连。`hybrid_context_parallel_forward_backward` 把两类通信错开排，减少互相堵。只在 hybrid CP 相关配置打开时进入；默认 1F1B 路径不经过这里。
 
 ---
 
