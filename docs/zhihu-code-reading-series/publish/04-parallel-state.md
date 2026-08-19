@@ -972,7 +972,7 @@ def test_rank_groups_world8():
 
 ---
 
-## 18. "90 分钟精读 parallel_state.py" 导读清单
+## 20. "90 分钟精读 parallel_state.py" 导读清单
 
 以下是一个有序的阅读路径，估计总时间 90 分钟：
 
@@ -1000,11 +1000,11 @@ def test_rank_groups_world8():
 - 快速浏览所有 `get_xxx_group()`、`get_xxx_rank()`、`get_xxx_world_size()` 函数
 - 理解 `_MPU_xxx_OVERRIDE` 机制：可以在运行时临时覆盖 rank/size（用于测试）
 
-**完成后做本文第 19 节的练习题作为自测。**
+**完成后做本文第 22 节的练习题作为自测。**
 
 ---
 
-## 19. 实战：手动触发进程组错误并定位
+## 21. 实战：手动触发进程组错误并定位
 
 以下是典型的进程组配置错误场景和诊断方法。
 
@@ -1054,7 +1054,7 @@ AssertionError: Both EP and CP > 1 in not allow in one rank generator. ...
 
 ---
 
-## 20. 练习题
+## 22. 练习题
 
 **题目 1**：world=16，TP=4，PP=2，DP=2，order="tp-dp-pp"。
 
@@ -1077,7 +1077,7 @@ AssertionError: Both EP and CP > 1 in not allow in one rank generator. ...
 
 ---
 
-## 20. 小结
+## 23. 小结
 
 `parallel_state.py` 的核心可以用三句话总结：
 
@@ -1087,7 +1087,7 @@ AssertionError: Both EP and CP > 1 in not allow in one rank generator. ...
 
 ---
 
-## 22. 附录：parallel_state.py 全局变量速查表
+## 24. 附录：parallel_state.py 全局变量速查表
 
 以下是 `parallel_state.py` 中最常用的全局变量及其含义，供快速查阅：
 
