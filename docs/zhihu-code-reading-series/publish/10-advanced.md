@@ -117,43 +117,81 @@ rank 3 负担（位置 3072-4095 + 4096-5119）：
 各 rank 的计算量几乎完全相同（相差 < 0.01%）
 ```
 
-### 2.4 CP 注意力的 Ring Attention 直觉
+### 2.4 CP 注意力的 Ring Attention 逐步图
 
 切分序列后，每个 CP rank 只有 Q/K/V 的一部分。自注意力要求每个 Q 能看到所有 K/V（causal 下看到之前的所有 K/V），这就需要跨 CP rank 的 K/V 通信。
 
-Ring Attention 方案：
+#### 方案 1：AllGather（直觉但贵）
 
+```text
+每个 rank AllGather 全序列的 K/V → 本地完整注意力
+通信量 = S × H × 2(K+V) × (CP-1)       # 每 rank 接收量随 CP 线性增长
 ```
-CP rank 0 拿着自己的 Q，先用本地 K/V 算一部分注意力，
-然后把 K/V 发给下一个 rank（同时从上一个 rank 接收），
-轮 CP 次后，每个 rank 的 Q 都看到了所有 K/V。
+
+#### 方案 2：Ring Attention（Megatron 默认 CP 方案）
+
+4 张卡排成环，K/V 沿环逆时针转，每轮只传 `S/CP` 个 token 的 K/V：
+
+```text
+设 CP=4, S=8192, 每 rank 持有 S/4=2048 tokens 的 Q/K/V
+  Q 固定不动，只有 K/V 在环上轮转
+
+                ┌── rank0 ──┐
+                │  Q0 K0 V0 │
+ rank3 ─────────┤           ├───────── rank1
+  Q3 K3 V3     │  ← ring   │         Q1 K1 V1
+                └─── rank2 ─┘
+                   Q2 K2 V2
+
+round 0: 每个 rank 用本地 K/V 算一部分 attn
+           rank0: Attn(Q0, K0, V0)
+           rank1: Attn(Q1, K1, V1)  …
+
+         同时发 K0/V0→rank1, 收 K3/V3←rank3（send/recv 并行）
+
+round 1: rank0 拿到 K3/V3 → Attn(Q0, K3, V3)
+         rank1 拿到 K0/V0 → Attn(Q1, K0, V0)  …
+         再发 K3/V3→rank1, 收 K2/V2←rank3
+
+round 2: rank0 拿到 K2/V2 → Attn(Q0, K2, V2)  …
+         再发/收最后一轮
+
+round 3 结束后: 每个 Q 都看到了所有 K/V
 ```
 
-这个"环形传递"使得通信和计算可以重叠（overlap），额外通信量是 `O(seq_len × H × CP)` 而非 AllGather 的 `O(seq_len × H × CP²)`。
+**通信量（seq=8192，CP=4，每轮传 2048 tokens 的 K+V）**：
 
-**seq=8192，CP=4 的 Ring Attention 通信量**：
-
+```text
+Ring: CP-1 = 3 轮 × 2048×H×2 / 轮 = 3×2048×H×2 = 12288 × H
+AllGather:                                          = (S×2×(CP-1))×H = 8192×2×3×H = 49152 × H
+比值: Ring / AllGather = 12288 / 49152 = 25%
 ```
-传统 AllGather K/V：
-  每个 rank 接收完整的 K/V：8192 × H × 2 × (CP-1) = 8192 × H × 6
 
-Ring Attention（每轮只传递 2048 个 token 的 K/V）：
-  CP-1 = 3 轮，每轮传 2048 × H × 2
-  总传输 = 3 × 2048 × H × 2 = 8192 × H × 1.5
+Ring 的带宽节省来自「每轮只传 S/CP 而不是 S」。代价：需要 CP-1 轮顺序依赖（但每轮内 compute 可以 overlap send/recv）。
 
-节省约 75% 的通信量（但有多轮等待）
-```
+**causal mask 下的优化**：rank r 的 Q 只需要看到「位置 ≤ 本 rank 最后一个 token」的 K/V。zigzag 分配后，靠后的 K/V 块可以跳过不算（`skip_mask`），进一步减少无效 GEMM。
+
+#### Hybrid CP：Ring + Ulysses 混合
+
+Megatron 的 `is_hybrid_cp=True` 模式把 CP 组拆成两级：
+
+- **内层（local CP group）**：用 Ulysses（AllToAll 重排 QKV，不是 Ring）；  
+- **外层（global CP group）**：用 Ring Attention。  
+
+适合 CP 很大时（如 CP=16）减少 Ring 的轮数：令外层 4 路 Ring × 内层 4 路 Ulysses，Ring 只需 3 轮（而非 15 轮）。
 
 ### 2.5 DP-CP 联合梯度同步
 
-CP 对梯度的影响：CP 组内不同 rank 的梯度来自同一条序列的不同段，它们**不是副本**，梯度之间不需要 AllReduce（每个 rank 负责自己那段的梯度）。
+CP 组内不同 rank 处理同一序列的不同段，**权重是完全相同的副本**（和 DP 同理），因此权重梯度需要在 CP 维上 AllReduce。
 
-但 DP 副本之间的梯度需要 AllReduce。因此 Megatron 维护 `dp_cp_group`（DP 与 CP 的联合组），DDP 的 AllReduce 在这个组上执行，保证跨 DP 副本、同 CP rank 的梯度被正确聚合。
+Megatron 维护 `dp_cp_group`（大小 = DP × CP），DDP 的梯度 AllReduce 在这个联合组上执行：
 
 ```python
-# distributed_data_parallel.py 中，AllReduce 使用 dp_cp_group
+# distributed_data_parallel.py
 self.ddp_config.data_parallel_group  # 实际是 dp_cp_group
 ```
+
+为什么不分开做「先 CP AllReduce 再 DP AllReduce」？合并成一个大组可以让 NCCL 用更大消息做一次 AllReduce / ReduceScatter，而不是两次小消息——带宽利用率更高，且 SHARP 只能绑一个组（§8 parallel_state 建组顺序解释了 dp-cp 第一个创建的原因）。
 
 ---
 

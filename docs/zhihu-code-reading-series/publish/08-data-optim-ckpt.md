@@ -735,27 +735,101 @@ model.load_state_dict(loaded)
 
 ---
 
-### 3.7 worked example：TP=2 保存，TP=4 加载的 resharding 思路
+### 3.7 worked example：TP=2 保存 → TP=4 加载的完整 resharding 逐步推演
 
-```
-保存时（TP=2）：
-  rank0 写: key="layers.0.attn.q_proj.weight"
-            local_shape=(2048,4096), global_offset=(0,0), global_shape=(4096,4096)
-  rank1 写: key="layers.0.attn.q_proj.weight"
-            local_shape=(2048,4096), global_offset=(2048,0), global_shape=(4096,4096)
+假设某一层的 `q_proj.weight` 全局 shape 为 `[4096, 4096]`（`[num_heads×head_dim, hidden]`），Column Parallel 沿第 0 轴（输出维）切分。
 
-加载时（TP=4）：
-  当前 rank0 期望: local_shape=(1024,4096), global_offset=(0,0)
-  当前 rank1 期望: local_shape=(1024,4096), global_offset=(1024,0)
-  ...
+#### 保存时（TP=2）
 
-框架动作（fully_parallel.py exchange_utils）：
-  读磁盘文件，发现 global_offset=(0,0), size=(2048,4096)
-  → 切割出 rank0 需要的 [0:1024, :] 和 rank1 需要的 [1024:2048, :]
-  → 通过 exchange_by_distribution 发给对应 rank
+每张卡在 `model.sharded_state_dict()` 里构造：
+
+```python
+ShardedTensor.from_rank_offsets(
+    key="decoder.layers.0.self_attention.linear_qkv.weight",
+    data=self.weight,               # 本卡 [2048, 4096]
+    (0, tp_rank, 2),                # axis=0, rank/size
+    replica_id=dp_rank,
+)
 ```
 
-整个 resharding 由 `dist_checkpointing/strategies/fully_parallel.py` 中的坐标映射逻辑完成，用户无需手写任何 split/cat。
+写盘后，磁盘上的两个 shard 元信息：
+
+```text
+shard A:  key=...qkv.weight  global_shape=(4096,4096)
+          local_shape=(2048,4096)  global_offset=(0,0)
+          axis_fragmentations=(2,1)  replica_id=0
+
+shard B:  key=...qkv.weight  global_shape=(4096,4096)
+          local_shape=(2048,4096)  global_offset=(2048,0)
+          axis_fragmentations=(2,1)  replica_id=0
+```
+
+#### 加载时（TP=4）
+
+当前进程用 TP=4 启动，先构造**空壳** `sharded_state_dict`：
+
+```python
+empty_st = model.sharded_state_dict()
+# 其中 tp_rank=0 的 ShardedTensor：
+#   key=...qkv.weight  local_shape=(1024,4096)
+#   global_offset=(0,0)  axis_fragmentations=(4,1)
+# tp_rank=1 → global_offset=(1024,0)
+# tp_rank=2 → global_offset=(2048,0)
+# tp_rank=3 → global_offset=(3072,0)
+```
+
+四张卡各期望拿到 `[1024, 4096]` 的片段。
+
+#### 框架内部做了什么（`exchange_utils` 路径）
+
+```text
+步骤 1：读磁盘
+  fully_parallel 策略把读文件任务**分给多个 rank**
+  （贪心分配，使 I/O 并行最大化）
+  例如 rank0 读 shard A，rank2 读 shard B
+
+步骤 2：切割与分发
+  rank0 拿到 shard A [2048, 4096]，但自己只需 [0:1024, :]
+  → 本地 slice 出 [0:1024, :]  留给自己
+  → slice [1024:2048, :] 通过 P2P / AllGather 发给 rank1
+
+  rank2 拿到 shard B [2048, 4096]，自己只需 [2048:3072, :]
+  → 本地 slice 出 [0:1024, :]（= global offset 2048）留给自己
+  → slice [1024:2048, :]（= global offset 3072）发给 rank3
+
+步骤 3：每个 rank 把收到的 tensor 填入 ShardedTensor.data
+```
+
+关键 API 链：
+
+```text
+dist_checkpointing.load()
+  → TorchDistLoadShardedStrategy.load()
+    → exchange_by_distribution()          # exchange_utils.py
+        → ShardDistribution               # 谁读哪个 shard
+        → exchange_loaded_tensors_broadcast / _gather_rounds
+           → P2P 或 AllGather 把磁盘数据送到真正需要它的 rank
+```
+
+用户**不需要**写 `split` / `cat` / P2P 代码。`ShardedTensor` 的 `key` + `global_offset` + `global_shape` 唯一标识了全局位置，框架自动匹配"磁盘上的 shard → 当前 rank 期望的 slice"。
+
+#### 同理可推：PP 改变
+
+PP 变了，层编号不变（`decoder.layers.3.*.weight` 的 `key` 一样），只是不同 PP rank 期望不同层的参数。框架按 key 路由，PP stage 上拿不到当前层参数时会从持有该 key 的 rank 获取。
+
+#### `replica_id` 与 DP 的关系
+
+DP 副本权重相同。保存时只写 `replica_id=0` 的主副本（`is_main_replica(sh_ten)` 判断），其余 rank 写 `data=None`。加载时所有 DP rank 都构造空壳，框架读一份后广播给同一 `replica_id` 组的 rank。DP 改变只影响哪些 rank 是副本，不影响全局 shape。
+
+#### DistOpt 优化器状态呢？
+
+优化器状态（Adam `m` / `v`）在 DistOpt 下按 DP 分片存（`flattened_range`），DP 变了 range 就变了，**无法直接 reshard**。换并行度最安全的做法：
+
+```bash
+--no-load-optim --no-load-rng
+```
+
+只加载模型参数，丢掉优化器和 RNG，从 warm-start 继续。
 
 ---
 
